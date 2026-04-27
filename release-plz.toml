@@ -1,13 +1,10 @@
 [workspace]
-# This project currently ships Rust binaries through GitHub Releases.
-# The ActivityWatch Rust crates used by the daemon are git-tracked locally and
-# their crates.io versions expose an older API, so crates.io publishing is
-# intentionally disabled for now.
-git_only = true
-publish = false
+# release-plz handles version bump, git tag, and crates.io publishing.
+# GitHub Release and npm publish are handled by release.yml (triggered by tag push).
+publish = true
 
 # The GitHub Release and artifacts are created by .github/workflows/release.yml
-# when this tag is pushed.
+# when the tag is pushed, so we disable release-plz's built-in GitHub release.
 git_release_enable = false
 git_tag_name = "v{{ version }}"
 
