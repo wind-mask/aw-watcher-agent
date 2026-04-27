@@ -6,7 +6,6 @@
 
 use anyhow::{Context, Result};
 use aw_client_rust::AwClient;
-use aw_models::Bucket;
 use tracing::{debug, warn};
 /// 默认 aw-server 端口
 pub const DEFAULT_PORT: u16 = 5600;
@@ -20,13 +19,13 @@ pub struct WatcherClient {
 
 impl WatcherClient {
     /// 创建新的客户端，连接到指定地址
-    pub async fn new(host: &str, port: u16, client_name: &str) -> Result<Self> {
+    pub fn new(host: &str, port: u16, client_name: &str) -> Result<Self> {
         debug!(
             "Creating AwClient for {}:{}, name={}",
             host, port, client_name
         );
-        let inner = AwClient::new(host, port, client_name)
-            .map_err(|e| anyhow::anyhow!("Failed to create AwClient: {}", e))?;
+        let port_str = port.to_string();
+        let inner = AwClient::new(host, &port_str, client_name);
 
         let hostname = inner.hostname.clone();
         debug!("AwClient hostname: {}", hostname);
@@ -41,14 +40,14 @@ impl WatcherClient {
     /// 从环境变量或默认值创建客户端
     /// - AW_HOST: aw-server 地址 (默认 localhost)
     /// - AW_PORT: aw-server 端口 (默认 5600)
-    pub async fn from_env() -> Result<Self> {
+    pub fn from_env() -> Result<Self> {
         let host = std::env::var("AW_HOST").unwrap_or_else(|_| "localhost".to_string());
         let port: u16 = std::env::var("AW_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(DEFAULT_PORT);
 
-        Self::new(&host, port, "aw-watcher-agent").await
+        Self::new(&host, port, "aw-watcher-agent")
     }
 
     /// 获取主机名（用于构造 bucket ID）
@@ -62,9 +61,9 @@ impl WatcherClient {
     }
 
     /// 测试与 aw-server 的连接
-    pub async fn check_connection(&self) -> Result<()> {
+    pub fn check_connection(&self) -> Result<()> {
         debug!("Checking connection to aw-server");
-        match self.inner.get_bucket("__connection_test__").await {
+        match self.inner.get_bucket("__connection_test__") {
             Ok(_) => {
                 debug!("Connection check: test bucket found");
                 Ok(())
@@ -82,37 +81,34 @@ impl WatcherClient {
     }
 
     /// 创建 bucket（幂等：已存在则忽略）
-    pub async fn create_bucket(&self, bucket: &Bucket) -> Result<()> {
-        debug!("Creating bucket: {}", bucket.id);
+    pub fn create_bucket(&self, bucket_id: &str, bucket_type: &str) -> Result<()> {
+        debug!("Creating bucket: {} (type: {})", bucket_id, bucket_type);
         self.inner
-            .create_bucket(bucket)
-            .await
+            .create_bucket(bucket_id, bucket_type)
             .context("Failed to create bucket")?;
         Ok(())
     }
 
     /// 删除 bucket
-    pub async fn delete_bucket(&self, bucket_id: &str) -> Result<()> {
+    pub fn delete_bucket(&self, bucket_id: &str) -> Result<()> {
         debug!("Deleting bucket: {}", bucket_id);
         self.inner
             .delete_bucket(bucket_id)
-            .await
             .context("Failed to delete bucket")?;
         Ok(())
     }
 
     /// 插入单个事件
-    pub async fn insert_event(&self, bucket_id: &str, event: &aw_models::Event) -> Result<()> {
+    pub fn insert_event(&self, bucket_id: &str, event: &aw_models::Event) -> Result<()> {
         debug!("Inserting event into bucket: {}", bucket_id);
         self.inner
             .insert_event(bucket_id, event)
-            .await
             .context("Failed to insert event")?;
         Ok(())
     }
 
     /// 发送心跳事件（用于持续时间追踪）
-    pub async fn heartbeat(
+    pub fn heartbeat(
         &self,
         bucket_id: &str,
         event: &aw_models::Event,
@@ -120,7 +116,6 @@ impl WatcherClient {
     ) -> Result<()> {
         self.inner
             .heartbeat(bucket_id, event, pulsetime)
-            .await
             .context("Failed to send heartbeat")?;
         Ok(())
     }

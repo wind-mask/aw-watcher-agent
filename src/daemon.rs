@@ -72,7 +72,7 @@ pub async fn run_daemon(
     buckets: BucketManager,
     listen: SocketAddr,
 ) -> Result<()> {
-    buckets.setup(&client).await?;
+    buckets.setup(&client)?;
     let state = AppState {
         client: Arc::new(client),
         bucket_id: buckets.session_bucket_id,
@@ -115,7 +115,7 @@ async fn session_heartbeat(
         )
     })?;
 
-    if let Err(err) = send_one_heartbeat(&state, session).await {
+    if let Err(err) = send_one_heartbeat(&state, session) {
         warn!("Heartbeat failed for session {}: {}", req.session_id, err);
         return Err(api_error(
             StatusCode::BAD_GATEWAY,
@@ -130,12 +130,11 @@ async fn session_heartbeat(
 }
 
 /// 对单个 session 发送一次 heartbeat
-async fn send_one_heartbeat(state: &AppState, session: &ActiveSession) -> Result<()> {
+fn send_one_heartbeat(state: &AppState, session: &ActiveSession) -> Result<()> {
     let heartbeat = build_heartbeat_event(session, false);
     state
         .client
         .heartbeat(&state.bucket_id, &heartbeat, PULSETIME_SECS)
-        .await
         .with_context(|| format!("heartbeat for session {}", session.session_id))
 }
 
@@ -194,7 +193,7 @@ async fn session_start(
         .insert(session_id.clone(), session.clone());
 
     // 立即发第一次 heartbeat，让 AW 立即可见
-    if let Err(err) = send_one_heartbeat(&state, &session).await {
+    if let Err(err) = send_one_heartbeat(&state, &session) {
         warn!(
             "Initial heartbeat failed for session {}: {}",
             session_id, err
@@ -266,7 +265,6 @@ async fn session_end(
     state
         .client
         .heartbeat(&state.bucket_id, &final_heartbeat, PULSETIME_SECS)
-        .await
         .map_err(|err| {
             error!("Final heartbeat failed for session {}: {}", session_id, err);
             api_error(

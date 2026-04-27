@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
         Commands::Daemon { .. } => "aw-watcher-agent-daemon",
         _ => "aw-watcher-agent-cli",
     };
-    let client = WatcherClient::new(&cli.host, port, client_name).await?;
+    let client = WatcherClient::new(&cli.host, port, client_name)?;
     info!(
         "Connected to aw-server at {}:{} as {}",
         cli.host, port, client_name
@@ -97,11 +97,11 @@ async fn main() -> Result<()> {
 
         Commands::Teardown => {
             info!("Tearing down buckets");
-            buckets.teardown(&client).await?;
+            buckets.teardown(&client)?;
             println!("Session and legacy tool buckets removed.");
         }
 
-        Commands::Status => match client.check_connection().await {
+        Commands::Status => match client.check_connection() {
             Ok(()) => {
                 info!("Connection check OK");
                 println!("✅ Connected to aw-server at {}:{}", cli.host, port)

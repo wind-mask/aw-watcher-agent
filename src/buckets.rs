@@ -4,8 +4,6 @@
 //! bucket type 使用 `app.editor.activity`，实际 data 中额外包含 code-agent 字段。
 
 use anyhow::Result;
-use aw_models::Bucket;
-use serde_json::Map;
 use tracing::{info, warn};
 
 use crate::client::WatcherClient;
@@ -29,50 +27,39 @@ impl BucketManager {
     }
 
     /// 创建 session bucket，并清理旧版 tool bucket。
-    pub async fn setup(&self, client: &WatcherClient) -> Result<()> {
+    pub fn setup(&self, client: &WatcherClient) -> Result<()> {
         info!("Setting up session bucket: {}", self.session_bucket_id);
-        self.ensure_session_bucket(client).await?;
-        Ok(())
+        self.ensure_session_bucket(client)
     }
 
-    /// 删除当前 session bucket 和旧版 tool bucket。
-    pub async fn teardown(&self, client: &WatcherClient) -> Result<()> {
+    /// 删除当前 session bucket。
+    pub fn teardown(&self, client: &WatcherClient) -> Result<()> {
         info!("Tearing down session bucket: {}", self.session_bucket_id);
-        let _ = client.delete_bucket(&self.session_bucket_id).await;
+        let _ = client.delete_bucket(&self.session_bucket_id);
         Ok(())
     }
 
-    async fn ensure_session_bucket(&self, client: &WatcherClient) -> Result<()> {
-        match client.inner().get_bucket(&self.session_bucket_id).await {
+    fn ensure_session_bucket(&self, client: &WatcherClient) -> Result<()> {
+        match client.inner().get_bucket(&self.session_bucket_id) {
             Ok(bucket) if bucket._type == SESSION_EVENT_TYPE => Ok(()),
             Ok(bucket) => {
                 warn!(
                     "Recreating bucket {}: type {} -> {}",
                     self.session_bucket_id, bucket._type, SESSION_EVENT_TYPE
                 );
-                let _ = client.delete_bucket(&self.session_bucket_id).await;
-                self.create_session_bucket(client).await
+                let _ = client.delete_bucket(&self.session_bucket_id);
+                self.create_session_bucket(client)
             }
             Err(err) if err.status().is_some_and(|status| status.as_u16() == 404) => {
-                self.create_session_bucket(client).await
+                self.create_session_bucket(client)
             }
             Err(err) => Err(anyhow::anyhow!("Failed to inspect bucket: {}", err)),
         }
     }
 
-    async fn create_session_bucket(&self, client: &WatcherClient) -> Result<()> {
-        let bucket = Bucket {
-            id: self.session_bucket_id.clone(),
-            bid: None,
-            _type: SESSION_EVENT_TYPE.to_string(),
-            data: Map::new(),
-            metadata: Default::default(),
-            last_updated: None,
-            hostname: client.hostname().to_string(),
-            client: "aw-watcher-agent".to_string(),
-            created: None,
-            events: None,
-        };
-        client.create_bucket(&bucket).await
+    fn create_session_bucket(&self, client: &WatcherClient) -> Result<()> {
+        // `aw-client-rust` 的 `create_bucket` 内部构造 Bucket struct，
+        // 这里传 bare string 即可，兼容 crates.io 版本的同步 API。
+        client.create_bucket(&self.session_bucket_id, SESSION_EVENT_TYPE)
     }
 }
