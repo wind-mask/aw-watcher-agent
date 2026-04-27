@@ -1,0 +1,26 @@
+[workspace]
+# This project currently ships Rust binaries through GitHub Releases.
+# The ActivityWatch Rust crates used by the daemon are git-tracked locally and
+# their crates.io versions expose an older API, so crates.io publishing is
+# intentionally disabled for now.
+git_only = true
+publish = false
+
+# The GitHub Release and artifacts are created by .github/workflows/release.yml
+# when this tag is pushed.
+git_release_enable = false
+git_tag_name = "v{{ version }}"
+
+# Only publish when the release-plz release PR is merged.
+release_always = false
+
+# This is a binary crate, and semver checks are not useful here.
+semver_check = false
+pr_labels = ["release"]
+
+[changelog]
+header = """# Changelog
+
+All notable changes to this project will be documented in this file.
+
+"""

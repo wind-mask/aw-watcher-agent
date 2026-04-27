@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release, e.g. v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  github-release:
+    name: Build binary and create GitHub Release
+    runs-on: ubuntu-latest
+    if: ${{ github.repository == 'wind-mask/aw-watcher-agent' }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Package binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          target="x86_64-unknown-linux-gnu"
+          archive="aw-watcher-agent-${version}-${target}.tar.gz"
+          mkdir -p dist/pkg
+          cp target/release/aw-watcher-agent dist/pkg/aw-watcher-agent
+          tar -C dist/pkg -czf "dist/${archive}" aw-watcher-agent
+          (cd dist && sha256sum "${archive}" > "${archive}.sha256")
+      - name: Create GitHub release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          artifacts: "dist/*.tar.gz,dist/*.sha256"
+          artifactErrorsFailBuild: true
+          generateReleaseNotes: true
+          immutableCreate: true
+          makeLatest: legacy
+
+  npm-publish:
+    name: Publish npm package
+    runs-on: ubuntu-latest
+    if: ${{ github.repository == 'wind-mask/aw-watcher-agent' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Sync package.json version from tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          npm version "${version}" --no-git-tag-version --allow-same-version
+      - name: Check npm package contents
+        run: npm pack --dry-run
+      - name: Publish to npm with provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_name="$(node -p "require('./package.json').name")"
+          if [[ "${package_name}" == @*/* ]]; then
+            npm publish --provenance --access public
+          else
+            npm publish --provenance
+          fi

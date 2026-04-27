@@ -1,0 +1,23 @@
+# cargo-deny configuration
+# See: https://embarkstudios.github.io/cargo-deny/
+
+# Note: aw-client-rust transitively depends on old reqwest -> old rustls -> vulnerable rustls-webpki
+# (RUSTSEC-2026-0098, RUSTSEC-2026-0099, RUSTSEC-2026-0104) and unmaintained rustls-pemfile
+# (RUSTSEC-2025-0134). These are inherited from the upstream ActivityWatch project and
+# cannot be fixed here. They are NOT currently in the cargo-deny advisory DB, but cargo-audit
+# reports them. Track upstream: https://github.com/ActivityWatch/aw-server-rust
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSL-1.0",
+    "ISC",
+    "BSD-3-Clause",
+    "MPL-2.0",
+    "Unicode-3.0",
+]
+clarify = [
+    { name = "aw-client-rust", expression = "MIT", license-files = [] },
+    { name = "aw-models", expression = "MIT", license-files = [] },
+]

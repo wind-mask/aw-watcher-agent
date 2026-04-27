@@ -1,0 +1,41 @@
+{
+  "name": "@wind_mask/aw-watcher-agent-pi",
+  "version": "0.1.0",
+  "author": "wind_mask",
+  "description": "Pi extension for ActivityWatch session tracking — records code agent sessions, models, token usage, and costs",
+  "keywords": [
+    "pi-package",
+    "activitywatch",
+    "session-tracking"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wind-mask/aw-watcher-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/wind-mask/aw-watcher-agent/issues"
+  },
+  "homepage": "https://github.com/wind-mask/aw-watcher-agent#readme",
+  "files": [
+    ".pi/extensions",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "provenance": true,
+    "access": "public"
+  },
+  "scripts": {
+    "pack:check": "npm pack --dry-run"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      ".pi/extensions"
+    ]
+  }
+}
