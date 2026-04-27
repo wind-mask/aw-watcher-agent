@@ -26,7 +26,7 @@ impl BucketManager {
         }
     }
 
-    /// 创建 session bucket，并清理旧版 tool bucket。
+    /// 创建 session bucket。
     pub fn setup(&self, client: &WatcherClient) -> Result<()> {
         info!("Setting up session bucket: {}", self.session_bucket_id);
         self.ensure_session_bucket(client)

@@ -23,6 +23,9 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@mariozechner/pi-coding-agent";
+import type { CostUsage } from "../bindings/CostUsage";
+import type { ModelUsage } from "../bindings/ModelUsage";
+import type { TokenUsage } from "../bindings/TokenUsage";
 
 const DAEMON_URL = (
   process.env.AW_WATCHER_DAEMON_URL ?? "http://127.0.0.1:5667"
@@ -38,27 +41,16 @@ const AGENT_HEARTBEAT_INTERVAL_MS = Math.max(
     : 15_000,
 );
 
-type TokenUsage = {
-  input?: number;
-  output?: number;
-  cache_read?: number;
-  cache_write?: number;
-  total?: number;
-};
-
-type CostUsage = {
-  total?: number;
-  currency?: string;
-};
-
-type ModelUsage = {
-  model: string;
-  tokens: TokenUsage;
-  cost: number;
-};
+// ---- 内部类型 ----
 
 type UsageSnapshot = {
-  tokens: Required<TokenUsage>;
+  tokens: {
+    input: number;
+    output: number;
+    cache_read: number;
+    cache_write: number;
+    total: number;
+  };
   cost: number;
 };
 
@@ -71,12 +63,16 @@ type PiUsageLike = {
   cost?: { total?: number } | number;
 };
 
+// ---- 状态 ----
+
 let currentSessionId: string | null = null;
 let daemonWarned = false;
 let currentModel: string | undefined;
 let lastBranchLength = 0;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let heartbeatInFlight = false;
+
+// ---- 用量计算 ----
 
 function emptyUsageSnapshot(): UsageSnapshot {
   return {
@@ -167,40 +163,65 @@ function consumeIncrementalUsage(
   const model_usage: ModelUsage[] = Array.from(modelMap.entries()).map(
     ([model, snap]) => ({
       model,
-      tokens: { ...snap.tokens },
+      tokens: {
+        input: snap.tokens.input,
+        output: snap.tokens.output,
+        cache_read: snap.tokens.cache_read,
+        cache_write: snap.tokens.cache_write,
+        total: snap.tokens.total,
+      },
       cost: snap.cost,
     }),
   );
 
   return {
-    tokens: { ...inc.tokens },
+    tokens: {
+      input: inc.tokens.input,
+      output: inc.tokens.output,
+      cache_read: inc.tokens.cache_read,
+      cache_write: inc.tokens.cache_write,
+      total: inc.tokens.total,
+    },
     cost: { total: inc.cost, currency: "USD" },
     model_usage,
   };
 }
 
-async function post(path: string, body: unknown): Promise<void> {
-  try {
-    const res = await fetch(`${DAEMON_URL}${path}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    });
+// ---- HTTP 通信（带重试） ----
 
-    if (!res.ok && !daemonWarned) {
-      daemonWarned = true;
-      console.log(`[aw-watcher] daemon returned HTTP ${res.status}`);
-    }
-  } catch (err) {
-    if (!daemonWarned) {
-      daemonWarned = true;
-      console.log(
-        `[aw-watcher] daemon unavailable at ${DAEMON_URL}; session will not be tracked.`,
-      );
-      console.log(err);
+const MAX_RETRIES = 3;
+const INITIAL_BACKOFF_MS = 100;
+
+async function post(path: string, body: unknown): Promise<void> {
+  let delay = INITIAL_BACKOFF_MS;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      const res = await fetch(`${DAEMON_URL}${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (res.ok) return;
+      if (!daemonWarned && attempt === MAX_RETRIES - 1) {
+        daemonWarned = true;
+        console.log(`[aw-watcher] daemon returned HTTP ${res.status}`);
+      }
+    } catch (err) {
+      if (attempt < MAX_RETRIES - 1) {
+        await new Promise((r) => setTimeout(r, delay));
+        delay *= 2;
+      } else if (!daemonWarned) {
+        daemonWarned = true;
+        console.log(
+          `[aw-watcher] daemon unavailable at ${DAEMON_URL}; session will not be tracked.`,
+        );
+        console.log(err);
+      }
     }
   }
 }
+
+// ---- 心跳管理 ----
 
 async function sendHeartbeat(sessionId: string): Promise<void> {
   if (heartbeatInFlight) {
@@ -238,6 +259,8 @@ function startAgentHeartbeat(): void {
     void sendHeartbeat(sessionId);
   }, AGENT_HEARTBEAT_INTERVAL_MS);
 }
+
+// ---- pi 事件钩子 ----
 
 export default function (pi: ExtensionAPI) {
   pi.on("model_select", async (event) => {

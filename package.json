@@ -20,6 +20,7 @@
   "homepage": "https://github.com/wind-mask/aw-watcher-agent#readme",
   "files": [
     ".pi/extensions",
+    ".pi/bindings",
     "LICENSE"
   ],
   "publishConfig": {

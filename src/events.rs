@@ -6,9 +6,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use ts_rs::TS;
 
 /// token 使用量。字段全部可选/可累加，方便不同 agent 只上报自己能拿到的数据。
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, TS)]
+#[ts(export)]
 pub struct TokenUsage {
     pub input: Option<u64>,
     pub output: Option<u64>,
@@ -50,7 +52,8 @@ impl TokenUsage {
 }
 
 /// 费用信息。不同 provider 的费用模型差异较大，因此只固定 total/currency。
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, TS)]
+#[ts(export)]
 pub struct CostUsage {
     pub total: Option<f64>,
     pub currency: Option<String>,
@@ -69,7 +72,8 @@ impl CostUsage {
 }
 
 /// 按模型拆分的用量汇总。
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, TS)]
+#[ts(export)]
 pub struct ModelUsage {
     pub model: String,
     pub tokens: TokenUsage,
@@ -77,7 +81,8 @@ pub struct ModelUsage {
 }
 
 /// 会话开始请求。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+#[ts(export)]
 pub struct SessionStartRequest {
     pub session_id: Option<String>,
     pub code_agent: String,
@@ -91,7 +96,8 @@ pub struct SessionStartRequest {
 
 /// 会话更新请求。用于更新模型、token、费用等聚合数据，
 /// 以及按模型拆分的增量用量（daemon 侧按模型累加）。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+#[ts(export)]
 pub struct SessionUpdateRequest {
     pub session_id: String,
     pub model: Option<String>,
@@ -102,7 +108,8 @@ pub struct SessionUpdateRequest {
 }
 /// 会话结束请求。按模型拆分的增量数据在结束时也会发送
 /// 最后一轮，确保 daemon 侧数据完整。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+#[ts(export)]
 pub struct SessionEndRequest {
     pub session_id: String,
     pub ended_at: Option<DateTime<Utc>>,
@@ -113,7 +120,8 @@ pub struct SessionEndRequest {
 }
 
 /// 会话心跳请求。由扩展周期性发送，表示该 session 仍然活跃。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+#[ts(export)]
 pub struct SessionHeartbeatRequest {
     pub session_id: String,
 }

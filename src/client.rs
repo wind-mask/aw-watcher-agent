@@ -1,12 +1,11 @@
 //! ActivityWatch 客户端封装。
 //!
-//! 提供连接管理、错误处理和重试逻辑。
-
-#![allow(dead_code)]
+//! 提供连接管理和错误处理。
 
 use anyhow::{Context, Result};
 use aw_client_rust::AwClient;
 use tracing::{debug, warn};
+
 /// 默认 aw-server 端口
 pub const DEFAULT_PORT: u16 = 5600;
 
@@ -14,7 +13,6 @@ pub const DEFAULT_PORT: u16 = 5600;
 pub struct WatcherClient {
     inner: AwClient,
     hostname: String,
-    port: u16,
 }
 
 impl WatcherClient {
@@ -30,34 +28,12 @@ impl WatcherClient {
         let hostname = inner.hostname.clone();
         debug!("AwClient hostname: {}", hostname);
 
-        Ok(Self {
-            inner,
-            hostname,
-            port,
-        })
-    }
-
-    /// 从环境变量或默认值创建客户端
-    /// - AW_HOST: aw-server 地址 (默认 localhost)
-    /// - AW_PORT: aw-server 端口 (默认 5600)
-    pub fn from_env() -> Result<Self> {
-        let host = std::env::var("AW_HOST").unwrap_or_else(|_| "localhost".to_string());
-        let port: u16 = std::env::var("AW_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(DEFAULT_PORT);
-
-        Self::new(&host, port, "aw-watcher-agent")
+        Ok(Self { inner, hostname })
     }
 
     /// 获取主机名（用于构造 bucket ID）
     pub fn hostname(&self) -> &str {
         &self.hostname
-    }
-
-    /// 获取当前端口
-    pub fn port(&self) -> u16 {
-        self.port
     }
 
     /// 测试与 aw-server 的连接
@@ -95,15 +71,6 @@ impl WatcherClient {
         self.inner
             .delete_bucket(bucket_id)
             .context("Failed to delete bucket")?;
-        Ok(())
-    }
-
-    /// 插入单个事件
-    pub fn insert_event(&self, bucket_id: &str, event: &aw_models::Event) -> Result<()> {
-        debug!("Inserting event into bucket: {}", bucket_id);
-        self.inner
-            .insert_event(bucket_id, event)
-            .context("Failed to insert event")?;
         Ok(())
     }
 

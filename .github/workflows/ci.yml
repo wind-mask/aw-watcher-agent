@@ -24,8 +24,14 @@ jobs:
         run: cargo fmt --check
       - name: Rust check
         run: cargo check --locked
-      - name: Rust test
+      - name: Rust clippy
+        run: cargo clippy --locked -- -D warnings
+      - name: Rust test (incl. TS bindings export)
         run: cargo test --locked
+      - name: Verify TS bindings up-to-date
+        run: git diff --exit-code .pi/bindings/
+      - name: Rust audit (advisory only)
+        run: cargo audit --deny warnings || true
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
