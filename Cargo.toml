@@ -11,11 +11,11 @@ homepage = "https://github.com/wind-mask/aw-watcher-agent"
 # Only ship source, license, changelog, and audit config to crates.io.
 include = [
     "src/**/*.rs",
-    "Cargo.toml",
-    "Cargo.lock",
-    "LICENSE",
-    "CHANGELOG.md",
-    "deny.toml",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/deny.toml",
 ]
 
 [dependencies]
