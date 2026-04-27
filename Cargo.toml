@@ -1,6 +1,6 @@
 [package]
 name = "aw-watcher-agent"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "ActivityWatch watcher for code agent sessions — tracks session duration, models, token usage, and costs"
 authors = ["wind_mask"]
