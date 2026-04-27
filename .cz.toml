@@ -1,0 +1,8 @@
+[tool.commitizen]
+name = "cz_gitmoji"
+tag_format = "v$version"
+version_scheme = "semver"
+version = "0.1.0"
+version_files = [
+    "Cargo.toml:version",
+]

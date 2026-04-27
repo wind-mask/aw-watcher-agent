@@ -21,6 +21,7 @@ jobs:
     if: ${{ github.repository == 'wind-mask/aw-watcher-agent' }}
     permissions:
       contents: write
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -44,6 +45,14 @@ jobs:
           cp target/release/aw-watcher-agent dist/pkg/aw-watcher-agent
           tar -C dist/pkg -czf "dist/${archive}" aw-watcher-agent
           (cd dist && sha256sum "${archive}" > "${archive}.sha256")
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --latest --verbose
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          OUTPUT: CHANGELOG.md
       - name: Create GitHub release
         uses: ncipollo/release-action@v1
         with:
@@ -51,7 +60,8 @@ jobs:
           name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           artifacts: "dist/*.tar.gz,dist/*.sha256"
           artifactErrorsFailBuild: true
-          generateReleaseNotes: true
+          bodyFile: CHANGELOG.md
+          generateReleaseNotes: false
           immutableCreate: true
           makeLatest: legacy
 

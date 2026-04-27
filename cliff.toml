@@ -1,0 +1,109 @@
+# git-cliff ~ configuration file
+# https://git-cliff.org/docs/configuration
+
+[changelog]
+header = """\
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+"""
+
+# Custom body template for releases
+body = """
+{% if version %}\
+    ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+    ## [unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+    ### {{ group | striptags | trim | upper_first }}
+    {% for commit in commits %}
+        - {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
+            {% if commit.breaking %}[**breaking**] {% endif %}\
+            {{ commit.message | upper_first }}\
+            {{ commit.message | upper_first }}\
+            {% if commit.remote.username %} by @{{ commit.remote.username }}{% endif %}\
+    {% endfor %}
+{% endfor %}
+"""
+
+# Footer template
+footer = """
+{% if previous and previous.version %}\
+    **Full Changelog**: {{ repository }}compare/{{ previous.version }}...{{ version }}
+{% endif %}\
+"""
+
+# Remove leading and trailing whitespaces
+trim = true
+
+# Render body even when there are no releases to process
+render_always = true
+
+# Postprocessors to modify the changelog output
+postprocessors = [
+    # Replace <REPO> with the actual repo URL
+    { pattern = '<REPO>', replace = "https://github.com/wind-mask/aw-watcher-agent" },
+]
+
+[git]
+# Parse commits according to the conventional commits specification
+conventional_commits = true
+
+# Exclude commits that do not match the conventional commits specification
+filter_unconventional = true
+
+# Split commits on newlines
+split_commits = false
+
+# Preprocessors to normalize commit messages before parsing
+commit_preprocessors = [
+    # Strip gitmoji emoji prefix (used by cz-gitmoji)
+    # Matches non-word/non-digit characters at the start followed by whitespace
+    { pattern = '^[^\w\d]+\s+', replace = "" },
+    # Replace issue numbers with links
+    { pattern = '\((\w+\s)?#([0-9]+)\)', replace = "([#${2}](<REPO>/issues/${2}))"},
+]
+
+# Protect breaking changes from being excluded
+protect_breaking_commits = false
+
+# Assign commits to groups based on conventional type
+commit_parsers = [
+    { message = "^feat", group = "<!-- 0 -->🚀 Features" },
+    { message = "^fix", group = "<!-- 1 -->🐛 Bug Fixes" },
+    { message = "^doc", group = "<!-- 3 -->📚 Documentation" },
+    { message = "^perf", group = "<!-- 4 -->⚡ Performance" },
+    { message = "^refactor", group = "<!-- 2 -->🚜 Refactor" },
+    { message = "^style", group = "<!-- 5 -->🎨 Styling" },
+    { message = "^test", group = "<!-- 6 -->🧪 Testing" },
+    { message = "^chore\\(release\\): prepare for", skip = true },
+    { message = "^chore\\(deps.*\\)", skip = true },
+    { message = "^chore\\(pr\\)", skip = true },
+    { message = "^chore\\(pull\\)", skip = true },
+    { message = "^chore|^ci", group = "<!-- 7 -->⚙️ Miscellaneous Tasks" },
+    { body = ".*security", group = "<!-- 8 -->🛡️ Security" },
+    { message = "^revert", group = "<!-- 9 -->◀️ Revert" },
+    { message = ".*", group = "<!-- 10 -->💼 Other" },
+]
+
+# Filter commits not matched by any parser
+filter_commits = false
+
+# Don't fail on unmatched commits
+fail_on_unmatched_commit = false
+
+# Link parsers for external references
+link_parsers = []
+
+# Order commits oldest first
+sort_commits = "oldest"
+
+# Order commits topologically
+topo_order_commits = true
+
+# Remote configuration for GitHub metadata
+[remote.github]
+owner = "wind-mask"
+repo = "aw-watcher-agent"
