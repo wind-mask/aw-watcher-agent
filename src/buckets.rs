@@ -40,9 +40,16 @@ impl BucketManager {
     }
 
     fn ensure_session_bucket(&self, client: &WatcherClient) -> Result<()> {
-        match client.inner().get_bucket(&self.session_bucket_id) {
-            Ok(bucket) if bucket._type == SESSION_EVENT_TYPE => Ok(()),
-            Ok(bucket) => {
+        // 使用 get_buckets() 而非 get_bucket()，避免 aw-server 404 响应
+        // 无法反序列化为 Bucket 导致 reqwest 0.10 decode error 丢失 status code。
+        let buckets = client
+            .inner()
+            .get_buckets()
+            .map_err(|e| anyhow::anyhow!("Failed to list buckets: {}", e))?;
+
+        match buckets.get(&self.session_bucket_id) {
+            Some(bucket) if bucket._type == SESSION_EVENT_TYPE => Ok(()),
+            Some(bucket) => {
                 warn!(
                     "Recreating bucket {}: type {} -> {}",
                     self.session_bucket_id, bucket._type, SESSION_EVENT_TYPE
@@ -50,10 +57,7 @@ impl BucketManager {
                 let _ = client.delete_bucket(&self.session_bucket_id);
                 self.create_session_bucket(client)
             }
-            Err(err) if err.status().is_some_and(|status| status.as_u16() == 404) => {
-                self.create_session_bucket(client)
-            }
-            Err(err) => Err(anyhow::anyhow!("Failed to inspect bucket: {}", err)),
+            None => self.create_session_bucket(client),
         }
     }
 

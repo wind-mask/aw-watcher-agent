@@ -12,9 +12,9 @@
  *   AW_WATCHER_DAEMON_URL - daemon 地址，默认 http://127.0.0.1:5667
  *
  * 架构说明：
- * - agent_start → heartbeat（会话保活）
- * - agent_end  → update（增量 token/cost + 按模型拆分的用量，daemon 侧累加）
- * - session_shutdown → end（含最后一批增量+分模型数据）
+ * - agent_start → 启动扩展侧定时 heartbeat（agent 运行期间保活）
+ * - agent_end  → 停止定时 heartbeat，并 update 增量 token/cost + 分模型用量
+ * - session_shutdown → 停止 heartbeat 并 end（含最后一批增量+分模型数据）
  * - session 结束时 AW bucket 的 final event 包含按模型的 token/cost 明细
  */
 
@@ -27,6 +27,16 @@ import type {
 const DAEMON_URL = (
   process.env.AW_WATCHER_DAEMON_URL ?? "http://127.0.0.1:5667"
 ).replace(/\/$/, "");
+
+const configuredHeartbeatInterval = Number(
+  process.env.AW_WATCHER_AGENT_HEARTBEAT_INTERVAL_MS ?? 15_000,
+);
+const AGENT_HEARTBEAT_INTERVAL_MS = Math.max(
+  5_000,
+  Number.isFinite(configuredHeartbeatInterval)
+    ? configuredHeartbeatInterval
+    : 15_000,
+);
 
 type TokenUsage = {
   input?: number;
@@ -65,6 +75,8 @@ let currentSessionId: string | null = null;
 let daemonWarned = false;
 let currentModel: string | undefined;
 let lastBranchLength = 0;
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+let heartbeatInFlight = false;
 
 function emptyUsageSnapshot(): UsageSnapshot {
   return {
@@ -86,9 +98,11 @@ function snapshotFromUsage(usage: PiUsageLike): UsageSnapshot {
       output,
       cache_read: cacheRead,
       cache_write: cacheWrite,
-      total: Number(usage.totalTokens ?? input + output + cacheRead + cacheWrite),
+      total: Number(
+        usage.totalTokens ?? input + output + cacheRead + cacheWrite,
+      ),
     },
-    cost: Number(typeof cost === "number" ? cost : cost?.total ?? 0),
+    cost: Number(typeof cost === "number" ? cost : (cost?.total ?? 0)),
   };
 }
 
@@ -188,6 +202,43 @@ async function post(path: string, body: unknown): Promise<void> {
   }
 }
 
+async function sendHeartbeat(sessionId: string): Promise<void> {
+  if (heartbeatInFlight) {
+    return;
+  }
+  heartbeatInFlight = true;
+  try {
+    await post("/api/v1/session/heartbeat", {
+      session_id: sessionId,
+    });
+  } finally {
+    heartbeatInFlight = false;
+  }
+}
+
+function stopAgentHeartbeat(): void {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+}
+
+function startAgentHeartbeat(): void {
+  if (!currentSessionId) return;
+  const sessionId = currentSessionId;
+
+  stopAgentHeartbeat();
+  void sendHeartbeat(sessionId);
+
+  heartbeatTimer = setInterval(() => {
+    if (currentSessionId !== sessionId) {
+      stopAgentHeartbeat();
+      return;
+    }
+    void sendHeartbeat(sessionId);
+  }, AGENT_HEARTBEAT_INTERVAL_MS);
+}
+
 export default function (pi: ExtensionAPI) {
   pi.on("model_select", async (event) => {
     currentModel = event?.model?.id ?? event?.model?.name ?? currentModel;
@@ -202,10 +253,9 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     currentSessionId = generateSessionId();
     // 记录当前 branch 长度，后续增量消费只处理新消息
-    lastBranchLength = (
-      ctx?.sessionManager?.getBranch?.() ?? []
-    ).length;
+    lastBranchLength = (ctx?.sessionManager?.getBranch?.() ?? []).length;
     currentModel = modelId(ctx);
+    stopAgentHeartbeat();
 
     await post("/api/v1/session/start", {
       session_id: currentSessionId,
@@ -218,17 +268,15 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
-  // agent_start：仅发 heartbeat 保活，不发数据（token/cost 稳定时避免 AW 切段）
+  // agent_start：agent 运行期间启动扩展侧定时 heartbeat，避免长时间生成时 AW pulsetime 超时
   pi.on("agent_start", async () => {
-    if (!currentSessionId) return;
-    await post("/api/v1/session/heartbeat", {
-      session_id: currentSessionId,
-    });
+    startAgentHeartbeat();
   });
 
-  // agent_end：只发增量 token/cost update，不发 heartbeat（减少冗余）
+  // agent_end：停止定时 heartbeat，只发增量 token/cost update（避免 token/cost 变化导致 AW 切段）
   pi.on("agent_end", async (_event, ctx) => {
     if (!currentSessionId) return;
+    stopAgentHeartbeat();
     currentModel = modelId(ctx);
     const delta = consumeIncrementalUsage(ctx);
 
@@ -248,6 +296,7 @@ export default function (pi: ExtensionAPI) {
     if (!currentSessionId) return;
     const sessionId = currentSessionId;
     currentSessionId = null;
+    stopAgentHeartbeat();
 
     currentModel = modelId(ctx);
     const delta = consumeIncrementalUsage(ctx);

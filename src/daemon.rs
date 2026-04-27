@@ -122,7 +122,7 @@ async fn session_heartbeat(
             format!("failed to write heartbeat: {}", err),
         ));
     }
-
+    info!("Heartbeat sent for session {}", req.session_id);
     Ok(Json(SessionResponse {
         ok: true,
         session_id: req.session_id,
