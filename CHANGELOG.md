@@ -1,0 +1,10 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+
+## [0.1.0](https://github.com/wind-mask/aw-watcher-agent/releases/tag/v0.1.0) - 2026-04-27
+
+### Added
+
+- initial aw-watcher-agent release
