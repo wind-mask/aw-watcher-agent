@@ -18,7 +18,6 @@
  * - session 结束时 daemon 将 token/cost 明细写入 sum bucket
  */
 
-import { randomUUID } from "node:crypto";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -113,10 +112,6 @@ function addUsageSnapshot(target: UsageSnapshot, source: UsageSnapshot): void {
   target.tokens.cache_write += source.tokens.cache_write;
   target.tokens.total += source.tokens.total;
   target.cost += source.cost;
-}
-
-function generateSessionId(): string {
-  return `pi-${randomUUID()}`;
 }
 
 function modelId(ctx: ExtensionContext): string | undefined {
@@ -309,7 +304,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    currentSessionId = generateSessionId();
+    currentSessionId = ctx.sessionManager.getSessionId();
     // 记录当前 branch 长度，后续增量消费只处理新消息
     lastBranchLength = (ctx?.sessionManager?.getBranch?.() ?? []).length;
     sessionUsage = emptyUsageSnapshot();
