@@ -13,9 +13,9 @@
  *
  * 架构说明：
  * - agent_start → 启动扩展侧定时 heartbeat（agent 运行期间保活）
- * - agent_end  → 停止定时 heartbeat，并 update 增量 token/cost + 分模型用量
- * - session_shutdown → 停止 heartbeat 并 end（含最后一批增量+分模型数据）
- * - session 结束时 AW bucket 的 final event 包含按模型的 token/cost 明细
+ * - agent_end  → 停止定时 heartbeat，本地累计 token/cost，并 update 当前模型
+ * - session_shutdown → 停止 heartbeat 并 end（含整个 session 的最终 usage 汇总）
+ * - session 结束时 daemon 将 token/cost 明细写入 sum bucket
  */
 
 import { randomUUID } from "node:crypto";
@@ -30,6 +30,7 @@ import type { TokenUsage } from "../bindings/TokenUsage";
 const DAEMON_URL = (
   process.env.AW_WATCHER_DAEMON_URL ?? "http://127.0.0.1:5667"
 ).replace(/\/$/, "");
+const CODE_AGENT = "pi";
 
 const configuredHeartbeatInterval = Number(
   process.env.AW_WATCHER_AGENT_HEARTBEAT_INTERVAL_MS ?? 15_000,
@@ -66,11 +67,14 @@ type PiUsageLike = {
 // ---- 状态 ----
 
 let currentSessionId: string | null = null;
-let daemonWarned = false;
+let daemonLastWarnAt = 0;
 let currentModel: string | undefined;
 let lastBranchLength = 0;
+let sessionUsage = emptyUsageSnapshot();
+let sessionModelUsage = new Map<string, UsageSnapshot>();
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let heartbeatInFlight = false;
+let heartbeatPendingSessionId: string | null = null;
 
 // ---- 用量计算 ----
 
@@ -112,7 +116,7 @@ function addUsageSnapshot(target: UsageSnapshot, source: UsageSnapshot): void {
 }
 
 function generateSessionId(): string {
-  return `pi-${randomUUID().substring(0, 8)}`;
+  return `pi-${randomUUID()}`;
 }
 
 function modelId(ctx: ExtensionContext): string | undefined {
@@ -121,13 +125,9 @@ function modelId(ctx: ExtensionContext): string | undefined {
 
 /**
  * 增量消费 branch 中新增的 assistant message 的 token/cost。
- * 只处理 lastBranchLength 之后的新条目，返回增量值（daemon 侧做累加）。
- * 同时按模型汇总，供 AW 最终事件写入分模型用量。
- * 返回 null 表示没有新数据需要上报。
+ * 扩展侧只在内存中累计，daemon 只在 session end 时接收最终 usage 汇总。
  */
-function consumeIncrementalUsage(
-  ctx: ExtensionContext,
-): { tokens: TokenUsage; cost: CostUsage; model_usage: ModelUsage[] } | null {
+function consumeIncrementalUsage(ctx: ExtensionContext): void {
   const branch = ctx?.sessionManager?.getBranch?.() ?? [];
   const startIdx = lastBranchLength;
 
@@ -158,32 +158,47 @@ function consumeIncrementalUsage(
   lastBranchLength = branch.length;
 
   const hasData = inc.tokens.total > 0 || inc.cost > 0;
-  if (!hasData) return null;
+  if (!hasData) return;
 
-  const model_usage: ModelUsage[] = Array.from(modelMap.entries()).map(
-    ([model, snap]) => ({
-      model,
-      tokens: {
-        input: snap.tokens.input,
-        output: snap.tokens.output,
-        cache_read: snap.tokens.cache_read,
-        cache_write: snap.tokens.cache_write,
-        total: snap.tokens.total,
-      },
-      cost: snap.cost,
-    }),
-  );
+  addUsageSnapshot(sessionUsage, inc);
+  for (const [model, snap] of modelMap.entries()) {
+    let target = sessionModelUsage.get(model);
+    if (!target) {
+      target = emptyUsageSnapshot();
+      sessionModelUsage.set(model, target);
+    }
+    addUsageSnapshot(target, snap);
+  }
+}
+
+function finalUsagePayload():
+  | { tokens: TokenUsage; cost: CostUsage; model_usage: ModelUsage[] }
+  | Record<string, never> {
+  const hasData = sessionUsage.tokens.total > 0 || sessionUsage.cost > 0;
+  if (!hasData) return {};
 
   return {
     tokens: {
-      input: inc.tokens.input,
-      output: inc.tokens.output,
-      cache_read: inc.tokens.cache_read,
-      cache_write: inc.tokens.cache_write,
-      total: inc.tokens.total,
+      input: sessionUsage.tokens.input,
+      output: sessionUsage.tokens.output,
+      cache_read: sessionUsage.tokens.cache_read,
+      cache_write: sessionUsage.tokens.cache_write,
+      total: sessionUsage.tokens.total,
     },
-    cost: { total: inc.cost, currency: "USD" },
-    model_usage,
+    cost: { total: sessionUsage.cost, currency: "USD" },
+    model_usage: Array.from(sessionModelUsage.entries()).map(
+      ([model, snap]) => ({
+        model,
+        tokens: {
+          input: snap.tokens.input,
+          output: snap.tokens.output,
+          cache_read: snap.tokens.cache_read,
+          cache_write: snap.tokens.cache_write,
+          total: snap.tokens.total,
+        },
+        cost: snap.cost,
+      }),
+    ),
   };
 }
 
@@ -191,6 +206,15 @@ function consumeIncrementalUsage(
 
 const MAX_RETRIES = 3;
 const INITIAL_BACKOFF_MS = 100;
+const DAEMON_WARN_INTERVAL_MS = 60_000;
+
+function warnDaemon(message: string, err?: unknown): void {
+  const now = Date.now();
+  if (now - daemonLastWarnAt < DAEMON_WARN_INTERVAL_MS) return;
+  daemonLastWarnAt = now;
+  console.log(message);
+  if (err) console.log(err);
+}
 
 async function post(path: string, body: unknown): Promise<void> {
   let delay = INITIAL_BACKOFF_MS;
@@ -202,20 +226,18 @@ async function post(path: string, body: unknown): Promise<void> {
         body: JSON.stringify(body),
       });
       if (res.ok) return;
-      if (!daemonWarned && attempt === MAX_RETRIES - 1) {
-        daemonWarned = true;
-        console.log(`[aw-watcher] daemon returned HTTP ${res.status}`);
+      if (attempt === MAX_RETRIES - 1) {
+        warnDaemon(`[aw-watcher] daemon returned HTTP ${res.status}`);
       }
     } catch (err) {
       if (attempt < MAX_RETRIES - 1) {
         await new Promise((r) => setTimeout(r, delay));
         delay *= 2;
-      } else if (!daemonWarned) {
-        daemonWarned = true;
-        console.log(
+      } else {
+        warnDaemon(
           `[aw-watcher] daemon unavailable at ${DAEMON_URL}; session will not be tracked.`,
+          err,
         );
-        console.log(err);
       }
     }
   }
@@ -225,13 +247,25 @@ async function post(path: string, body: unknown): Promise<void> {
 
 async function sendHeartbeat(sessionId: string): Promise<void> {
   if (heartbeatInFlight) {
+    heartbeatPendingSessionId = sessionId;
     return;
   }
   heartbeatInFlight = true;
   try {
-    await post("/api/v1/session/heartbeat", {
-      session_id: sessionId,
-    });
+    let nextSessionId: string | null = sessionId;
+    while (nextSessionId) {
+      heartbeatPendingSessionId = null;
+      await post("/api/v1/session/heartbeat", {
+        session_id: nextSessionId,
+        code_agent: CODE_AGENT,
+      });
+
+      const pendingSessionId = heartbeatPendingSessionId;
+      nextSessionId =
+        pendingSessionId && currentSessionId === pendingSessionId
+          ? pendingSessionId
+          : null;
+    }
   } finally {
     heartbeatInFlight = false;
   }
@@ -268,6 +302,7 @@ export default function (pi: ExtensionAPI) {
     if (currentSessionId) {
       await post("/api/v1/session/update", {
         session_id: currentSessionId,
+        code_agent: CODE_AGENT,
         model: currentModel,
       });
     }
@@ -277,12 +312,14 @@ export default function (pi: ExtensionAPI) {
     currentSessionId = generateSessionId();
     // 记录当前 branch 长度，后续增量消费只处理新消息
     lastBranchLength = (ctx?.sessionManager?.getBranch?.() ?? []).length;
+    sessionUsage = emptyUsageSnapshot();
+    sessionModelUsage = new Map<string, UsageSnapshot>();
     currentModel = modelId(ctx);
     stopAgentHeartbeat();
 
     await post("/api/v1/session/start", {
       session_id: currentSessionId,
-      code_agent: "pi",
+      code_agent: CODE_AGENT,
       project_dir: process.cwd(),
       model: currentModel,
       metadata: {
@@ -296,25 +333,21 @@ export default function (pi: ExtensionAPI) {
     startAgentHeartbeat();
   });
 
-  // agent_end：停止定时 heartbeat，只发增量 token/cost update（避免 token/cost 变化导致 AW 切段）
+  // agent_end：停止定时 heartbeat，只在扩展侧累计 usage，daemon 只在 end 接收最终汇总。
   pi.on("agent_end", async (_event, ctx) => {
     if (!currentSessionId) return;
     stopAgentHeartbeat();
     currentModel = modelId(ctx);
-    const delta = consumeIncrementalUsage(ctx);
+    consumeIncrementalUsage(ctx);
 
-    if (delta) {
-      await post("/api/v1/session/update", {
-        session_id: currentSessionId,
-        model: currentModel,
-        tokens: delta.tokens,
-        cost: delta.cost,
-        model_usage: delta.model_usage,
-      });
-    }
+    await post("/api/v1/session/update", {
+      session_id: currentSessionId,
+      code_agent: CODE_AGENT,
+      model: currentModel,
+    });
   });
 
-  // session_shutdown：发最后一批增量数据并结束 session
+  // session_shutdown：发送整个 session 的最终 usage 汇总并结束 session。
   pi.on("session_shutdown", async (_event, ctx) => {
     if (!currentSessionId) return;
     const sessionId = currentSessionId;
@@ -322,13 +355,14 @@ export default function (pi: ExtensionAPI) {
     stopAgentHeartbeat();
 
     currentModel = modelId(ctx);
-    const delta = consumeIncrementalUsage(ctx);
+    consumeIncrementalUsage(ctx);
+    const usage = finalUsagePayload();
 
     await post("/api/v1/session/end", {
       session_id: sessionId,
-      tokens: delta?.tokens,
-      cost: delta?.cost,
-      model_usage: delta?.model_usage,
+      code_agent: CODE_AGENT,
+      ended_at: new Date().toISOString(),
+      ...usage,
     });
   });
 }

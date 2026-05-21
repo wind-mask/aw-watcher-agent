@@ -17,7 +17,7 @@ pub struct WatcherClient {
 
 impl WatcherClient {
     /// 创建新的客户端，连接到指定地址
-    pub fn new(host: &str, port: u16, client_name: &str) -> Result<Self> {
+    pub fn new(host: &str, port: u16, client_name: &str) -> Self {
         debug!(
             "Creating AwClient for {}:{}, name={}",
             host, port, client_name
@@ -28,7 +28,7 @@ impl WatcherClient {
         let hostname = inner.hostname.clone();
         debug!("AwClient hostname: {}", hostname);
 
-        Ok(Self { inner, hostname })
+        Self { inner, hostname }
     }
 
     /// 获取主机名（用于构造 bucket ID）
@@ -39,21 +39,10 @@ impl WatcherClient {
     /// 测试与 aw-server 的连接
     pub fn check_connection(&self) -> Result<()> {
         debug!("Checking connection to aw-server");
-        match self.inner.get_bucket("__connection_test__") {
-            Ok(_) => {
-                debug!("Connection check: test bucket found");
-                Ok(())
-            }
-            Err(e) => {
-                if e.status().is_some_and(|status| status.as_u16() == 404) {
-                    debug!("Connection check OK (404 on test bucket)");
-                    Ok(())
-                } else {
-                    warn!("Connection check failed: {}", e);
-                    Err(anyhow::anyhow!("Connection failed: {}", e))
-                }
-            }
-        }
+        self.inner.get_buckets().map(|_| ()).map_err(|e| {
+            warn!("Connection check failed: {}", e);
+            anyhow::anyhow!("Connection failed: {}", e)
+        })
     }
 
     /// 创建 bucket（幂等：已存在则忽略）
@@ -84,6 +73,14 @@ impl WatcherClient {
         self.inner
             .heartbeat(bucket_id, event, pulsetime)
             .context("Failed to send heartbeat")?;
+        Ok(())
+    }
+
+    /// 写入普通 AW event（用于 summary bucket）
+    pub fn insert_event(&self, bucket_id: &str, event: &aw_models::Event) -> Result<()> {
+        self.inner
+            .insert_event(bucket_id, event)
+            .context("Failed to insert event")?;
         Ok(())
     }
 

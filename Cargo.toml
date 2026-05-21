@@ -1,6 +1,6 @@
 [package]
 name = "aw-watcher-agent"
-version = "0.1.1"
+version = "0.1.5"
 edition = "2021"
 description = "ActivityWatch watcher for code agent sessions — tracks session duration, models, token usage, and costs"
 authors = ["wind_mask"]
@@ -30,7 +30,6 @@ url = "2.5"
 axum = "0.8"
 uuid = { version = "1.23", features = ["v4", "serde"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1.44"
 ts-rs = { version = "12", features = ["chrono-impl", "uuid-impl", "serde-json-impl"] }
-dashmap = "6"

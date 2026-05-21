@@ -3,4 +3,4 @@
 /**
  * 会话心跳请求。由扩展周期性发送，表示该 session 仍然活跃。
  */
-export type SessionHeartbeatRequest = { session_id: string, };
+export type SessionHeartbeatRequest = { session_id: string, code_agent: string, };

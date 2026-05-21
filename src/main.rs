@@ -37,8 +37,8 @@ struct Cli {
     host: String,
 
     /// aw-server 端口 (默认 5600)
-    #[arg(long, global = true)]
-    port: Option<u16>,
+    #[arg(long, global = true, default_value_t = DEFAULT_PORT)]
+    port: u16,
 }
 
 #[derive(Subcommand, Debug)]
@@ -50,7 +50,7 @@ enum Commands {
         listen: SocketAddr,
     },
 
-    /// 删除 session bucket
+    /// 删除 watcher 创建的 event/sum bucket
     Teardown,
 
     /// 检查与 aw-server 的连接
@@ -70,17 +70,18 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let port = cli.port.unwrap_or(DEFAULT_PORT);
+    let port = cli.port;
     let command = cli.command.unwrap_or(Commands::Daemon {
         listen: default_daemon_listen(),
     });
 
     // 避免 daemon 与临时 CLI 命令争用 aw-client-rust 的 single-instance lock。
-    let client_name = match command {
-        Commands::Daemon { .. } => "aw-watcher-agent-daemon",
-        _ => "aw-watcher-agent-cli",
+    let client_name = if matches!(&command, Commands::Daemon { .. }) {
+        "aw-watcher-agent-daemon"
+    } else {
+        "aw-watcher-agent-cli"
     };
-    let client = WatcherClient::new(&cli.host, port, client_name)?;
+    let client = WatcherClient::new(&cli.host, port, client_name);
     info!(
         "Connected to aw-server at {}:{} as {}",
         cli.host, port, client_name
@@ -94,8 +95,8 @@ async fn main() -> Result<()> {
         }
         Commands::Teardown => {
             info!("Tearing down buckets");
-            buckets.teardown(&client)?;
-            println!("Session bucket removed.");
+            buckets.teardown(&client);
+            println!("Event and summary buckets removed.");
         }
         Commands::Status => match client.check_connection() {
             Ok(()) => {

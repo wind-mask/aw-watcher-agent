@@ -1,6 +1,6 @@
 {
   "name": "@wind_mask/aw-watcher-agent-pi",
-  "version": "0.1.0",
+  "version": "0.1.5",
   "author": "wind_mask",
   "description": "Pi extension for ActivityWatch session tracking — records code agent sessions, models, token usage, and costs",
   "keywords": [

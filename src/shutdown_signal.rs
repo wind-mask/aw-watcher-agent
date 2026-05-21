@@ -7,15 +7,38 @@ use tracing::warn;
 pub async fn wait_for_shutdown_signal() -> &'static str {
     use tokio::signal::unix::{signal, SignalKind};
 
-    match signal(SignalKind::terminate()) {
-        Ok(mut terminate) => {
+    let mut interrupt = match signal(SignalKind::interrupt()) {
+        Ok(signal) => Some(signal),
+        Err(err) => {
+            warn!("Failed to register SIGINT handler: {}", err);
+            None
+        }
+    };
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(signal) => Some(signal),
+        Err(err) => {
+            warn!("Failed to register SIGTERM handler: {}", err);
+            None
+        }
+    };
+
+    match (&mut interrupt, &mut terminate) {
+        (Some(interrupt), Some(terminate)) => {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => "SIGINT",
+                _ = interrupt.recv() => "SIGINT",
                 _ = terminate.recv() => "SIGTERM",
             }
         }
-        Err(err) => {
-            warn!("Failed to register SIGTERM handler: {}", err);
+        (Some(interrupt), None) => {
+            let _ = interrupt.recv().await;
+            "SIGINT"
+        }
+        (None, Some(terminate)) => {
+            let _ = terminate.recv().await;
+            "SIGTERM"
+        }
+        (None, None) => {
+            warn!("No shutdown signal handlers could be registered; falling back to ctrl_c()");
             let _ = tokio::signal::ctrl_c().await;
             "SIGINT"
         }

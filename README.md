@@ -58,7 +58,8 @@ This repository ships two parts:
 
 1. **Rust daemon** (`aw-watcher-agent`)
    - Receives HTTP session events from code-agent integrations.
-   - Writes ActivityWatch heartbeat events to the bucket `aw-watcher-agent_<hostname>`.
+   - Writes merged live activity heartbeats to `aw-watcher-agent-event_<hostname>`.
+   - Writes per-session completed/abandoned summaries to `aw-watcher-agent-sum_<hostname>`.
 
 2. **pi extension** (`.pi/extensions/aw-watcher.ts`)
    - Hooks into pi session/model/agent lifecycle events.
@@ -70,7 +71,8 @@ This repository ships two parts:
 
 1. **Rust daemon** (`aw-watcher-agent`)
    - 接收来自 code agent 集成的 HTTP session 事件。
-   - 将 ActivityWatch heartbeat 写入 `aw-watcher-agent_<hostname>` bucket。
+   - 将合并后的实时活动 heartbeat 写入 `aw-watcher-agent-event_<hostname>`。
+   - 将单个 session 的 completed/abandoned 汇总写入 `aw-watcher-agent-sum_<hostname>`。
 
 2. **pi 扩展** (`.pi/extensions/aw-watcher.ts`)
    - 监听 pi 的 session/model/agent 生命周期事件。
@@ -80,13 +82,43 @@ This repository ships two parts:
 
 ## ActivityWatch data model
 
-The daemon writes to an ActivityWatch bucket with type:
+The daemon writes two ActivityWatch buckets:
 
 ```text
-app.editor.activity
+aw-watcher-agent-event_<hostname>  type=app.editor.activity
+aw-watcher-agent-sum_<hostname>    type=app.code-agent.summary
 ```
 
-The final completed event contains top-level aggregate fields:
+The event bucket contains merged live activity. If multiple agent sessions are
+active at the same time, they are represented as one heartbeat event:
+
+```json
+{
+  "status": "active",
+  "language": "code-agent",
+  "project": "multiple",
+  "file": "multiple",
+  "active_session_count": 2,
+  "code_agents": ["pi", "codex"],
+  "projects": ["aw-watcher-agent", "virt"],
+  "project_dirs": ["/path/to/aw-watcher-agent", "/path/to/virt"],
+  "sessions": [
+    {
+      "code_agent": "pi",
+      "session_id": "pi-72aa7acf",
+      "project": "aw-watcher-agent",
+      "project_dir": "/path/to/aw-watcher-agent",
+      "model": "deepseek-v4-pro"
+    }
+  ]
+}
+```
+
+The sum bucket contains one event per session active period. Its ActivityWatch
+event `timestamp` is the start of the active period, `duration` is the active
+duration in seconds, and `data` contains session metadata and completion state.
+Completed summaries also contain the final usage reported by the session end
+event:
 
 ```json
 {
@@ -96,20 +128,15 @@ The final completed event contains top-level aggregate fields:
   "project": "aw-watcher-agent",
   "project_dir": "/path/to/aw-watcher-agent",
   "model": "deepseek-v4-pro",
+  "active_duration_seconds": 42.5,
+  "wall_duration_seconds": 80.2,
   "tokens_input": 24364,
   "tokens_output": 95,
   "tokens_cache_read": 5120,
   "tokens_cache_write": 0,
   "tokens_total": 29579,
   "cost_total": 0.02621523,
-  "cost_currency": "USD"
-}
-```
-
-For multi-model sessions, the final event also contains `model_usage`:
-
-```json
-{
+  "cost_currency": "USD",
   "model_usage": {
     "deepseek-v4-flash": {
       "tokens_input": 8050,
@@ -131,17 +158,49 @@ For multi-model sessions, the final event also contains `model_usage`:
 }
 ```
 
-`model_usage` values sum to the top-level token/cost totals.
+Sessions that were active but timed out before an end event are written to the
+sum bucket with `"status": "abandoned"` and `"reason": "timeout"`. Because no
+end event was received, abandoned summaries do not try to reconstruct token or
+cost usage.
 
 ## ActivityWatch 数据模型
 
-daemon 写入的 ActivityWatch bucket 类型为：
+daemon 写入两个 ActivityWatch bucket：
 
 ```text
-app.editor.activity
+aw-watcher-agent-event_<hostname>  type=app.editor.activity
+aw-watcher-agent-sum_<hostname>    type=app.code-agent.summary
 ```
 
-最终的 completed event 会包含顶层汇总字段，例如：
+event bucket 记录合并后的实时活动；如果多个 agent session 同时活跃，会被合成
+一条 heartbeat：
+
+```json
+{
+  "status": "active",
+  "language": "code-agent",
+  "project": "multiple",
+  "file": "multiple",
+  "active_session_count": 2,
+  "code_agents": ["pi", "codex"],
+  "projects": ["aw-watcher-agent", "virt"],
+  "project_dirs": ["/path/to/aw-watcher-agent", "/path/to/virt"],
+  "sessions": [
+    {
+      "code_agent": "pi",
+      "session_id": "pi-72aa7acf",
+      "project": "aw-watcher-agent",
+      "project_dir": "/path/to/aw-watcher-agent",
+      "model": "deepseek-v4-pro"
+    }
+  ]
+}
+```
+
+sum bucket 每条 event 对应一个 session 活跃期。ActivityWatch event 的
+`timestamp` 是活跃期开始时间，`duration` 是活跃秒数，`data` 包含 session
+元数据和完成状态。completed summary 还会包含 session end 事件上报的最终
+usage：
 
 ```json
 {
@@ -151,20 +210,15 @@ app.editor.activity
   "project": "aw-watcher-agent",
   "project_dir": "/path/to/aw-watcher-agent",
   "model": "deepseek-v4-pro",
+  "active_duration_seconds": 42.5,
+  "wall_duration_seconds": 80.2,
   "tokens_input": 24364,
   "tokens_output": 95,
   "tokens_cache_read": 5120,
   "tokens_cache_write": 0,
   "tokens_total": 29579,
   "cost_total": 0.02621523,
-  "cost_currency": "USD"
-}
-```
-
-如果一个 session 使用了多个模型，final event 还会包含 `model_usage`：
-
-```json
-{
+  "cost_currency": "USD",
   "model_usage": {
     "deepseek-v4-flash": {
       "tokens_input": 8050,
@@ -186,7 +240,9 @@ app.editor.activity
 }
 ```
 
-`model_usage` 中各模型的 token/cost 之和会等于顶层汇总值。
+活跃过但超时前没有收到 end 事件的 session 会以 `"status": "abandoned"` 和
+`"reason": "timeout"` 写入 sum bucket。由于没有收到 end 事件，abandoned
+summary 不会尝试重建 token 或费用用量。
 
 ---
 
@@ -271,7 +327,7 @@ Check daemon status:
 aw-watcher-agent status
 ```
 
-Remove the ActivityWatch bucket created by this watcher:
+Remove the ActivityWatch buckets created by this watcher:
 
 ```bash
 aw-watcher-agent teardown
@@ -325,7 +381,7 @@ aw-watcher-agent daemon
 aw-watcher-agent status
 ```
 
-删除本 watcher 创建的 ActivityWatch bucket：
+删除本 watcher 创建的 ActivityWatch buckets：
 
 ```bash
 aw-watcher-agent teardown
@@ -366,6 +422,52 @@ When a pi session is resumed, the extension records only usage produced after th
 ## Resume 行为
 
 当 pi session 被 resume 时，扩展只记录 resume 之后新增的用量。resume 前已经存在于 session 文件中的历史消息不会被重复计入。
+
+---
+
+## Migrating legacy data
+
+Versions before the dual-bucket data model wrote everything to the legacy
+`aw-watcher-agent_<hostname>` bucket. To backfill existing exports into the new
+`aw-watcher-agent-event_<hostname>` and `aw-watcher-agent-sum_<hostname>`
+buckets, export the old bucket from ActivityWatch and run:
+
+```bash
+python3 scripts/migrate_legacy_aw_bucket.py aw-bucket-export_aw-watcher-agent_<hostname>.json --output migrated-aw-watcher-agent.json
+```
+
+The command above is a dry run and writes a converted export file. After
+reviewing the printed counts, import directly into a running ActivityWatch
+server with:
+
+```bash
+python3 scripts/migrate_legacy_aw_bucket.py aw-bucket-export_aw-watcher-agent_<hostname>.json --apply
+```
+
+Use `--skip-event-bucket` to migrate only completed/abandoned summaries, or
+`--skip-abandoned` to avoid creating abandoned summaries for sessions that never
+sent an end event.
+
+## 迁移旧数据
+
+双 bucket 数据模型之前的版本会把所有数据写入旧的
+`aw-watcher-agent_<hostname>` bucket。要把已有导出回填到新的
+`aw-watcher-agent-event_<hostname>` 和 `aw-watcher-agent-sum_<hostname>`
+buckets，先从 ActivityWatch 导出旧 bucket，然后运行：
+
+```bash
+python3 scripts/migrate_legacy_aw_bucket.py aw-bucket-export_aw-watcher-agent_<hostname>.json --output migrated-aw-watcher-agent.json
+```
+
+上面的命令是 dry run，并会写出转换后的 export 文件。确认输出统计无误后，可以
+直接导入到正在运行的 ActivityWatch：
+
+```bash
+python3 scripts/migrate_legacy_aw_bucket.py aw-bucket-export_aw-watcher-agent_<hostname>.json --apply
+```
+
+如果只想迁移 completed/abandoned 汇总，可加 `--skip-event-bucket`；如果不想为
+没有 end 事件的 session 创建 abandoned summary，可加 `--skip-abandoned`。
 
 ---
 
