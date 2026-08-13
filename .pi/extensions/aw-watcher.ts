@@ -1,29 +1,29 @@
 /**
  * aw-watcher pi 扩展
  *
- * 新架构：不再为每个事件 spawn CLI，而是向后台 aw-watcher-agent daemon
- * 发送 HTTP session 事件。扩展只记录会话级信息：code agent、项目目录、模型、
- * token 用量和费用；不记录 prompt 文本，也不记录 tool 调用。
- *
- * 先启动 daemon：
- *   aw-watcher-agent daemon
+ * 扩展向本机 aw-watcher-agent daemon 上报 session 生命周期。活动时间由 Pi
+ * 事件和扩展侧 heartbeat 的采样时间决定；daemon 只负责聚合并写入 ActivityWatch。
+ * 扩展只记录会话级信息，不记录 prompt、assistant 文本或工具参数。
  *
  * 环境变量：
  *   AW_WATCHER_DAEMON_URL - daemon 地址，默认 http://127.0.0.1:5667
+ *   AW_WATCHER_AGENT_HEARTBEAT_INTERVAL_MS - agent 运行期间的 heartbeat 间隔
  *
- * 架构说明：
- * - agent_start → 启动扩展侧定时 heartbeat（agent 运行期间保活）
- * - agent_end  → 停止定时 heartbeat，本地累计 token/cost，并 update 当前模型
- * - session_shutdown → 停止 heartbeat 并 end（含整个 session 的最终 usage 汇总）
- * - session 结束时 daemon 将 token/cost 明细写入 sum bucket
+ * session_id 是 Pi 的逻辑 session ID；session_instance_id 标识本次扩展生命周期，
+ * 用于区分 reload、resume 或重复启动产生的运行片段。
  */
 
+import { randomUUID } from "node:crypto";
 import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@mariozechner/pi-coding-agent";
 import type { CostUsage } from "../bindings/CostUsage";
 import type { ModelUsage } from "../bindings/ModelUsage";
+import type { SessionEndRequest } from "../bindings/SessionEndRequest";
+import type { SessionHeartbeatRequest } from "../bindings/SessionHeartbeatRequest";
+import type { SessionStartRequest } from "../bindings/SessionStartRequest";
+import type { SessionUpdateRequest } from "../bindings/SessionUpdateRequest";
 import type { TokenUsage } from "../bindings/TokenUsage";
 
 const DAEMON_URL = (
@@ -63,17 +63,57 @@ type PiUsageLike = {
   cost?: { total?: number } | number;
 };
 
+type UsageMessageLike = {
+  role?: string;
+  provider?: string;
+  model?: string;
+  responseModel?: string;
+  usage?: PiUsageLike;
+};
+
+type UsageEntryLike = {
+  id?: string;
+  type?: string;
+  message?: UsageMessageLike;
+  usage?: PiUsageLike;
+};
+
+type ModelLike = {
+  id?: string;
+  name?: string;
+  provider?: string;
+};
+
+type SessionIdentity = {
+  sessionId: string;
+  instanceId: string;
+};
+
+type ActivityOptions = {
+  active?: boolean;
+  activeAt?: string;
+};
+
+type UsagePayload = {
+  tokens: TokenUsage | null;
+  cost: CostUsage | null;
+  model_usage: ModelUsage[] | null;
+};
+
 // ---- 状态 ----
 
 let currentSessionId: string | null = null;
-let daemonLastWarnAt = 0;
+let currentSessionInstanceId: string | null = null;
 let currentModel: string | undefined;
-let lastBranchLength = 0;
 let sessionUsage = emptyUsageSnapshot();
 let sessionModelUsage = new Map<string, UsageSnapshot>();
+let consumedUsageEntryIds = new Set<string>();
+
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-let heartbeatInFlight = false;
-let heartbeatPendingSessionId: string | null = null;
+let heartbeatIdentity: SessionIdentity | null = null;
+
+// 请求串行进入 daemon，确保 start、heartbeat、update、end 顺序与 Pi 事件一致。
+let requestChain: Promise<void> = Promise.resolve();
 
 // ---- 用量计算 ----
 
@@ -84,11 +124,18 @@ function emptyUsageSnapshot(): UsageSnapshot {
   };
 }
 
+function finiteNonNegative(value: unknown): number {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number) && number >= 0 ? number : 0;
+}
+
 function snapshotFromUsage(usage: PiUsageLike): UsageSnapshot {
-  const input = Number(usage.input ?? 0);
-  const output = Number(usage.output ?? 0);
-  const cacheRead = Number(usage.cacheRead ?? 0);
-  const cacheWrite = Number(usage.cacheWrite ?? 0);
+  const input = finiteNonNegative(usage.input);
+  const output = finiteNonNegative(usage.output);
+  const cacheRead = finiteNonNegative(usage.cacheRead);
+  const cacheWrite = finiteNonNegative(usage.cacheWrite);
+  const componentTotal = input + output + cacheRead + cacheWrite;
+  const reportedTotal = finiteNonNegative(usage.totalTokens);
   const cost = usage.cost;
 
   return {
@@ -97,11 +144,12 @@ function snapshotFromUsage(usage: PiUsageLike): UsageSnapshot {
       output,
       cache_read: cacheRead,
       cache_write: cacheWrite,
-      total: Number(
-        usage.totalTokens ?? input + output + cacheRead + cacheWrite,
-      ),
+      // 与 Pi session totals 一致；无分项时才回退到 totalTokens。
+      total: componentTotal > 0 ? componentTotal : reportedTotal,
     },
-    cost: Number(typeof cost === "number" ? cost : (cost?.total ?? 0)),
+    cost: finiteNonNegative(
+      typeof cost === "number" ? cost : (cost?.total ?? 0),
+    ),
   };
 }
 
@@ -114,63 +162,89 @@ function addUsageSnapshot(target: UsageSnapshot, source: UsageSnapshot): void {
   target.cost += source.cost;
 }
 
+function hasUsage(snapshot: UsageSnapshot): boolean {
+  return snapshot.tokens.total > 0 || snapshot.cost > 0;
+}
+
+function normalizeModel(
+  model: ModelLike | undefined,
+  fallback?: string,
+): string | undefined {
+  const id = model?.id ?? model?.name ?? fallback;
+  if (!id) return undefined;
+  const provider = model?.provider;
+  return provider && !id.includes("/") ? `${provider}/${id}` : id;
+}
+
 function modelId(ctx: ExtensionContext): string | undefined {
-  return ctx?.model?.id ?? ctx?.model?.name ?? currentModel;
+  return normalizeModel(ctx?.model, currentModel);
+}
+
+function modelForUsage(message: UsageMessageLike): string {
+  const model =
+    message.responseModel ?? message.model ?? currentModel ?? "unknown";
+  return message.provider && !model.includes("/")
+    ? `${message.provider}/${model}`
+    : model;
+}
+
+function usageForEntry(
+  entry: UsageEntryLike,
+): { model: string; snapshot: UsageSnapshot } | undefined {
+  if (entry.type === "message" && entry.message?.usage) {
+    const message = entry.message;
+    if (message.role === "assistant") {
+      return {
+        model: modelForUsage(message),
+        snapshot: snapshotFromUsage(message.usage),
+      };
+    }
+    if (message.role === "toolResult") {
+      return {
+        model: "Tools/summaries",
+        snapshot: snapshotFromUsage(message.usage),
+      };
+    }
+  }
+
+  if (
+    (entry.type === "compaction" || entry.type === "branch_summary") &&
+    entry.usage
+  ) {
+    return {
+      model: "Tools/summaries",
+      snapshot: snapshotFromUsage(entry.usage),
+    };
+  }
+
+  return undefined;
 }
 
 /**
- * 增量消费 branch 中新增的 assistant message 的 token/cost。
- * 扩展侧只在内存中累计，daemon 只在 session end 时接收最终 usage 汇总。
+ * 按稳定 entry ID 消费整个 session 的新增 usage。resume 时已有 entry 会先标记
+ * 为已消费，因此每个 session_instance 只上报本次运行片段产生的增量。
  */
 function consumeIncrementalUsage(ctx: ExtensionContext): void {
-  const branch = ctx?.sessionManager?.getBranch?.() ?? [];
-  const startIdx = lastBranchLength;
+  const entries = ctx?.sessionManager?.getEntries?.() ?? [];
+  for (const rawEntry of entries) {
+    const entry = rawEntry as UsageEntryLike;
+    if (!entry.id || consumedUsageEntryIds.has(entry.id)) continue;
+    consumedUsageEntryIds.add(entry.id);
 
-  const inc = emptyUsageSnapshot();
-  const modelMap = new Map<string, UsageSnapshot>();
+    const usage = usageForEntry(entry);
+    if (!usage || !hasUsage(usage.snapshot)) continue;
 
-  for (let i = startIdx; i < branch.length; i++) {
-    const entry = branch[i];
-    const message = entry?.type === "message" ? entry.message : undefined;
-    if (!message || message.role !== "assistant") continue;
-
-    const usage = message.usage;
-    if (!usage) continue;
-
-    const model = message.model ?? currentModel ?? "unknown";
-    const usageSnapshot = snapshotFromUsage(usage);
-
-    addUsageSnapshot(inc, usageSnapshot);
-
-    let m = modelMap.get(model);
-    if (!m) {
-      m = emptyUsageSnapshot();
-      modelMap.set(model, m);
-    }
-    addUsageSnapshot(m, usageSnapshot);
-  }
-
-  lastBranchLength = branch.length;
-
-  const hasData = inc.tokens.total > 0 || inc.cost > 0;
-  if (!hasData) return;
-
-  addUsageSnapshot(sessionUsage, inc);
-  for (const [model, snap] of modelMap.entries()) {
-    let target = sessionModelUsage.get(model);
-    if (!target) {
-      target = emptyUsageSnapshot();
-      sessionModelUsage.set(model, target);
-    }
-    addUsageSnapshot(target, snap);
+    addUsageSnapshot(sessionUsage, usage.snapshot);
+    const target = sessionModelUsage.get(usage.model) ?? emptyUsageSnapshot();
+    addUsageSnapshot(target, usage.snapshot);
+    sessionModelUsage.set(usage.model, target);
   }
 }
 
-function finalUsagePayload():
-  | { tokens: TokenUsage; cost: CostUsage; model_usage: ModelUsage[] }
-  | Record<string, never> {
-  const hasData = sessionUsage.tokens.total > 0 || sessionUsage.cost > 0;
-  if (!hasData) return {};
+function usagePayload(): UsagePayload {
+  if (!hasUsage(sessionUsage)) {
+    return { tokens: null, cost: null, model_usage: null };
+  }
 
   return {
     tokens: {
@@ -181,92 +255,78 @@ function finalUsagePayload():
       total: sessionUsage.tokens.total,
     },
     cost: { total: sessionUsage.cost, currency: "USD" },
-    model_usage: Array.from(sessionModelUsage.entries()).map(
-      ([model, snap]) => ({
+    model_usage: Array.from(sessionModelUsage.entries())
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([model, snapshot]) => ({
         model,
         tokens: {
-          input: snap.tokens.input,
-          output: snap.tokens.output,
-          cache_read: snap.tokens.cache_read,
-          cache_write: snap.tokens.cache_write,
-          total: snap.tokens.total,
+          input: snapshot.tokens.input,
+          output: snapshot.tokens.output,
+          cache_read: snapshot.tokens.cache_read,
+          cache_write: snapshot.tokens.cache_write,
+          total: snapshot.tokens.total,
         },
-        cost: snap.cost,
-      }),
-    ),
+        cost: snapshot.cost,
+      })),
   };
 }
 
-// ---- HTTP 通信（带重试） ----
+// ---- 本机 HTTP 通信 ----
 
-const MAX_RETRIES = 3;
-const INITIAL_BACKOFF_MS = 100;
-const DAEMON_WARN_INTERVAL_MS = 60_000;
-
-function warnDaemon(message: string, err?: unknown): void {
-  const now = Date.now();
-  if (now - daemonLastWarnAt < DAEMON_WARN_INTERVAL_MS) return;
-  daemonLastWarnAt = now;
-  console.log(message);
-  if (err) console.log(err);
+async function postNow(path: string, body: unknown): Promise<boolean> {
+  try {
+    const response = await fetch(`${DAEMON_URL}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (response.ok) return true;
+    console.warn(
+      `[aw-watcher] daemon returned HTTP ${response.status} for ${path}`,
+    );
+  } catch (err) {
+    console.warn(`[aw-watcher] daemon unavailable at ${DAEMON_URL}`, err);
+  }
+  return false;
 }
 
-async function post(path: string, body: unknown): Promise<void> {
-  let delay = INITIAL_BACKOFF_MS;
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    try {
-      const res = await fetch(`${DAEMON_URL}${path}`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      if (res.ok) return;
-      if (attempt === MAX_RETRIES - 1) {
-        warnDaemon(`[aw-watcher] daemon returned HTTP ${res.status}`);
-      }
-    } catch (err) {
-      if (attempt < MAX_RETRIES - 1) {
-        await new Promise((r) => setTimeout(r, delay));
-        delay *= 2;
-      } else {
-        warnDaemon(
-          `[aw-watcher] daemon unavailable at ${DAEMON_URL}; session will not be tracked.`,
-          err,
-        );
-      }
-    }
-  }
+function post(path: string, body: unknown): Promise<boolean> {
+  const operation = requestChain.then(() => postNow(path, body));
+  requestChain = operation.then(
+    () => undefined,
+    () => undefined,
+  );
+  return operation;
 }
 
 // ---- 心跳管理 ----
 
-async function sendHeartbeat(sessionId: string): Promise<void> {
-  if (heartbeatInFlight) {
-    heartbeatPendingSessionId = sessionId;
-    return;
-  }
-  heartbeatInFlight = true;
-  try {
-    let nextSessionId: string | null = sessionId;
-    while (nextSessionId) {
-      heartbeatPendingSessionId = null;
-      await post("/api/v1/session/heartbeat", {
-        session_id: nextSessionId,
-        code_agent: CODE_AGENT,
-      });
+function sameIdentity(
+  left: SessionIdentity | null,
+  right: SessionIdentity,
+): boolean {
+  return (
+    left?.sessionId === right.sessionId && left.instanceId === right.instanceId
+  );
+}
 
-      const pendingSessionId = heartbeatPendingSessionId;
-      nextSessionId =
-        pendingSessionId && currentSessionId === pendingSessionId
-          ? pendingSessionId
-          : null;
-    }
-  } finally {
-    heartbeatInFlight = false;
-  }
+async function sendHeartbeat(
+  identity: SessionIdentity,
+  heartbeatAt: string,
+): Promise<void> {
+  if (!sameIdentity(heartbeatIdentity, identity)) return;
+
+  const body: SessionHeartbeatRequest = {
+    session_id: identity.sessionId,
+    session_instance_id: identity.instanceId,
+    code_agent: CODE_AGENT,
+    heartbeat_at: heartbeatAt,
+  };
+  await post("/api/v1/session/heartbeat", body);
 }
 
 function stopAgentHeartbeat(): void {
+  heartbeatIdentity = null;
   if (heartbeatTimer) {
     clearInterval(heartbeatTimer);
     heartbeatTimer = null;
@@ -274,90 +334,159 @@ function stopAgentHeartbeat(): void {
 }
 
 function startAgentHeartbeat(): void {
-  if (!currentSessionId) return;
-  const sessionId = currentSessionId;
+  if (!currentSessionId || !currentSessionInstanceId) return;
+  const identity: SessionIdentity = {
+    sessionId: currentSessionId,
+    instanceId: currentSessionInstanceId,
+  };
 
   stopAgentHeartbeat();
-  void sendHeartbeat(sessionId);
-
+  heartbeatIdentity = identity;
+  void sendHeartbeat(identity, new Date().toISOString());
   heartbeatTimer = setInterval(() => {
-    if (currentSessionId !== sessionId) {
-      stopAgentHeartbeat();
-      return;
-    }
-    void sendHeartbeat(sessionId);
+    void sendHeartbeat(identity, new Date().toISOString());
   }, AGENT_HEARTBEAT_INTERVAL_MS);
 }
 
-// ---- pi 事件钩子 ----
+function updateBody(
+  identity: SessionIdentity,
+  activity: ActivityOptions = {},
+): SessionUpdateRequest {
+  return {
+    session_id: identity.sessionId,
+    session_instance_id: identity.instanceId,
+    code_agent: CODE_AGENT,
+    model: currentModel ?? null,
+    ...usagePayload(),
+    active: activity.active ?? null,
+    active_at: activity.activeAt ?? null,
+    metadata: null,
+  };
+}
+
+async function postUsageSnapshot(ctx: ExtensionContext): Promise<void> {
+  if (!currentSessionId || !currentSessionInstanceId) return;
+  currentModel = modelId(ctx);
+  consumeIncrementalUsage(ctx);
+  await post(
+    "/api/v1/session/update",
+    updateBody({
+      sessionId: currentSessionId,
+      instanceId: currentSessionInstanceId,
+    }),
+  );
+}
+
+// ---- Pi 事件钩子 ----
 
 export default function (pi: ExtensionAPI) {
   pi.on("model_select", async (event) => {
-    currentModel = event?.model?.id ?? event?.model?.name ?? currentModel;
-    if (currentSessionId) {
-      await post("/api/v1/session/update", {
-        session_id: currentSessionId,
-        code_agent: CODE_AGENT,
-        model: currentModel,
-      });
+    currentModel = normalizeModel(event?.model, currentModel);
+    if (currentSessionId && currentSessionInstanceId) {
+      await post(
+        "/api/v1/session/update",
+        updateBody({
+          sessionId: currentSessionId,
+          instanceId: currentSessionInstanceId,
+        }),
+      );
     }
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    stopAgentHeartbeat();
     currentSessionId = ctx.sessionManager.getSessionId();
-    // 记录当前 branch 长度，后续增量消费只处理新消息
-    lastBranchLength = (ctx?.sessionManager?.getBranch?.() ?? []).length;
+    currentSessionInstanceId = randomUUID();
+    currentModel = modelId(ctx);
     sessionUsage = emptyUsageSnapshot();
     sessionModelUsage = new Map<string, UsageSnapshot>();
-    currentModel = modelId(ctx);
-    stopAgentHeartbeat();
+    consumedUsageEntryIds = new Set(
+      ctx.sessionManager.getEntries().map((entry) => entry.id),
+    );
 
-    await post("/api/v1/session/start", {
+    const sessionStart: SessionStartRequest = {
       session_id: currentSessionId,
+      session_instance_id: currentSessionInstanceId,
       code_agent: CODE_AGENT,
-      project_dir: process.cwd(),
-      model: currentModel,
-      metadata: {
-        extension: "pi-aw-watcher",
-      },
-    });
+      project_dir: ctx.sessionManager.getCwd() || ctx.cwd,
+      model: currentModel ?? null,
+      started_at: new Date().toISOString(),
+      metadata: { extension: "pi-aw-watcher" },
+    };
+    await post("/api/v1/session/start", sessionStart);
   });
 
-  // agent_start：agent 运行期间启动扩展侧定时 heartbeat，避免长时间生成时 AW pulsetime 超时
+  // 低层 run 开始时立即发一次 heartbeat，并由扩展定时续写。
   pi.on("agent_start", async () => {
     startAgentHeartbeat();
   });
 
-  // agent_end：停止定时 heartbeat，只在扩展侧累计 usage，daemon 只在 end 接收最终汇总。
+  // agent_end 可能紧接自动 retry；此时只同步快照并保持活动状态。
   pi.on("agent_end", async (_event, ctx) => {
-    if (!currentSessionId) return;
-    stopAgentHeartbeat();
+    if (!currentSessionId || !currentSessionInstanceId) return;
     currentModel = modelId(ctx);
     consumeIncrementalUsage(ctx);
-
-    await post("/api/v1/session/update", {
-      session_id: currentSessionId,
-      code_agent: CODE_AGENT,
-      model: currentModel,
-    });
+    const identity = {
+      sessionId: currentSessionId,
+      instanceId: currentSessionInstanceId,
+    };
+    void post(
+      "/api/v1/session/update",
+      updateBody(identity, {
+        active: true,
+        activeAt: new Date().toISOString(),
+      }),
+    );
   });
 
-  // session_shutdown：发送整个 session 的最终 usage 汇总并结束 session。
-  pi.on("session_shutdown", async (_event, ctx) => {
-    if (!currentSessionId) return;
-    const sessionId = currentSessionId;
-    currentSessionId = null;
-    stopAgentHeartbeat();
-
+  // settled 表示 retry、compaction 和 queued follow-up 均已结束。
+  pi.on("agent_settled", async (_event, ctx) => {
+    if (!currentSessionId || !currentSessionInstanceId) return;
     currentModel = modelId(ctx);
     consumeIncrementalUsage(ctx);
-    const usage = finalUsagePayload();
+    const identity = {
+      sessionId: currentSessionId,
+      instanceId: currentSessionInstanceId,
+    };
+    stopAgentHeartbeat();
+    await post(
+      "/api/v1/session/update",
+      updateBody(identity, {
+        active: false,
+        activeAt: new Date().toISOString(),
+      }),
+    );
+  });
 
-    await post("/api/v1/session/end", {
-      session_id: sessionId,
+  // 空闲时手动 compact/tree 也可能生成计费用量，但不构成活动信号。
+  pi.on("session_compact", async (_event, ctx) => {
+    await postUsageSnapshot(ctx);
+  });
+  pi.on("session_tree", async (_event, ctx) => {
+    await postUsageSnapshot(ctx);
+  });
+
+  pi.on("session_shutdown", async (event, ctx) => {
+    if (!currentSessionId || !currentSessionInstanceId) return;
+    const identity = {
+      sessionId: currentSessionId,
+      instanceId: currentSessionInstanceId,
+    };
+    stopAgentHeartbeat();
+    currentModel = modelId(ctx);
+    consumeIncrementalUsage(ctx);
+
+    const body: SessionEndRequest = {
+      session_id: identity.sessionId,
+      session_instance_id: identity.instanceId,
       code_agent: CODE_AGENT,
       ended_at: new Date().toISOString(),
-      ...usage,
-    });
+      ...usagePayload(),
+      metadata: { shutdown_reason: event.reason },
+    };
+
+    currentSessionId = null;
+    currentSessionInstanceId = null;
+    await post("/api/v1/session/end", body);
   });
 }

@@ -4,4 +4,4 @@ import type { JsonValue } from "./serde_json/JsonValue";
 /**
  * 会话开始请求。
  */
-export type SessionStartRequest = { session_id: string, code_agent: string, project_dir: string, model: string | null, started_at: string | null, metadata: JsonValue | null, };
+export type SessionStartRequest = { session_id: string, session_instance_id: string | null, code_agent: string, project_dir: string, model: string | null, started_at: string | null, metadata: JsonValue | null, };

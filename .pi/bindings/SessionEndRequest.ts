@@ -7,4 +7,4 @@ import type { JsonValue } from "./serde_json/JsonValue";
 /**
  * 会话结束请求。usage 字段应为整个 session 的最终汇总。
  */
-export type SessionEndRequest = { session_id: string, code_agent: string, ended_at: string | null, tokens: TokenUsage | null, cost: CostUsage | null, model_usage: Array<ModelUsage> | null, metadata: JsonValue | null, };
+export type SessionEndRequest = { session_id: string, session_instance_id: string | null, code_agent: string, ended_at: string | null, tokens: TokenUsage | null, cost: CostUsage | null, model_usage: Array<ModelUsage> | null, metadata: JsonValue | null, };

@@ -20,8 +20,9 @@ ActivityWatch watcher for code-agent sessions. It records high-level AI coding s
 
 - code agent name (`pi`)
 - project directory/name
-- session duration via ActivityWatch heartbeats
-- current/final model
+- logical Pi session ID and per-run `session_instance_id`
+- session duration via ActivityWatch heartbeats sampled by the Pi extension
+- actual model used for token/cost usage and the selected model separately
 - total token usage and cost
 - per-model token/cost breakdown for sessions that use multiple models
 
@@ -38,8 +39,9 @@ It does **not** record:
 
 - code agent 名称，例如 `pi`
 - 项目目录/项目名
-- 通过 ActivityWatch heartbeat 记录的 session 时长
-- 当前/最终使用的模型
+- Pi 逻辑 session ID 和每次运行的 `session_instance_id`
+- 由 Pi 扩展 heartbeat 采样的 session 时长
+- 实际产生 usage 的模型，以及单独记录当前选中的模型
 - 总 token 用量和费用
 - 多模型 session 中按模型拆分的 token/cost 明细
 
@@ -106,6 +108,7 @@ active at the same time, they are represented as one heartbeat event:
     {
       "code_agent": "pi",
       "session_id": "pi-72aa7acf",
+      "session_instance_id": "...",
       "project": "aw-watcher-agent",
       "project_dir": "/path/to/aw-watcher-agent",
       "model": "deepseek-v4-pro"
@@ -114,20 +117,27 @@ active at the same time, they are represented as one heartbeat event:
 }
 ```
 
-The sum bucket contains one event per session active period. Its ActivityWatch
+Each live heartbeat is timestamped with the sampling time reported by the
+extension (`agent_start`, periodic heartbeat, `agent_settled`, or end). The
+daemon only aggregates these reported times; it does not generate periodic
+activity itself.
+
+The sum bucket contains one event per session instance. Its ActivityWatch
 event `timestamp` is the start of the active period, `duration` is the active
-duration in seconds, and `data` contains session metadata and completion state.
-Completed summaries also contain the final usage reported by the session end
-event:
+duration in seconds, and `data` contains session metadata and completion
+state. Completed summaries contain the final usage reported by the session
+end event:
 
 ```json
 {
   "status": "completed",
   "session_id": "pi-72aa7acf",
+  "session_instance_id": "...",
   "code_agent": "pi",
   "project": "aw-watcher-agent",
   "project_dir": "/path/to/aw-watcher-agent",
   "model": "deepseek-v4-pro",
+  "selected_model": "gpt-5.4",
   "active_duration_seconds": 42.5,
   "wall_duration_seconds": 80.2,
   "tokens_input": 24364,
@@ -158,10 +168,15 @@ event:
 }
 ```
 
-Sessions that were active but timed out before an end event are written to the
-sum bucket with `"status": "abandoned"` and `"reason": "timeout"`. Because no
-end event was received, abandoned summaries do not try to reconstruct token or
-cost usage.
+Top-level `model` reflects the actual usage model (`"multiple"` when more
+than one model produced usage); `selected_model` records the model selected
+for the session. Usage snapshots are cumulative per instance, and top-level
+token/cost totals are derived from `model_usage` so they always match it.
+
+Sessions that were active but timed out before an end event are written to
+the sum bucket with `"status": "abandoned"` and `"reason": "timeout"` (or
+`"reason": "duplicate_start"` / `"shutdown"`). Abandoned summaries keep the
+last usage snapshot received before the timeout.
 
 ## ActivityWatch 数据模型
 
@@ -189,6 +204,7 @@ event bucket 记录合并后的实时活动；如果多个 agent session 同时�
     {
       "code_agent": "pi",
       "session_id": "pi-72aa7acf",
+      "session_instance_id": "...",
       "project": "aw-watcher-agent",
       "project_dir": "/path/to/aw-watcher-agent",
       "model": "deepseek-v4-pro"
@@ -197,19 +213,24 @@ event bucket 记录合并后的实时活动；如果多个 agent session 同时�
 }
 ```
 
-sum bucket 每条 event 对应一个 session 活跃期。ActivityWatch event 的
+每条实时 heartbeat 都带有扩展上报的采样时间（`agent_start`、定时 heartbeat、
+`agent_settled` 或 end）；daemon 只负责聚合并写入，不自行生成周期性活动。
+
+sum bucket 每条 event 对应一个 session 实例。ActivityWatch event 的
 `timestamp` 是活跃期开始时间，`duration` 是活跃秒数，`data` 包含 session
-元数据和完成状态。completed summary 还会包含 session end 事件上报的最终
+元数据和完成状态。completed summary 包含 session end 事件上报的最终
 usage：
 
 ```json
 {
   "status": "completed",
   "session_id": "pi-72aa7acf",
+  "session_instance_id": "...",
   "code_agent": "pi",
   "project": "aw-watcher-agent",
   "project_dir": "/path/to/aw-watcher-agent",
   "model": "deepseek-v4-pro",
+  "selected_model": "gpt-5.4",
   "active_duration_seconds": 42.5,
   "wall_duration_seconds": 80.2,
   "tokens_input": 24364,
@@ -240,14 +261,16 @@ usage：
 }
 ```
 
-活跃过但超时前没有收到 end 事件的 session 会以 `"status": "abandoned"` 和
-`"reason": "timeout"` 写入 sum bucket。由于没有收到 end 事件，abandoned
-summary 不会尝试重建 token 或费用用量。
+顶层 `model` 反映实际产生 usage 的模型（多个模型时记为 `"multiple"`）；
+`selected_model` 记录会话当前选中的模型。usage 快照按实例累计，顶层
+token/cost 由 `model_usage` 汇总得到，两者始终一致。
+
+活跃过但未收到 end 事件的 session 会以 `"status": "abandoned"` 和
+`"reason": "timeout"`（或 `"reason": "duplicate_start"` / `"shutdown"`）写入
+sum bucket；abandoned summary 会保留超时前最后收到的 usage 快照。
 
 ---
-
 ## Installation
-
 ### Rust daemon
 
 Download the binary from GitHub Releases, or build from source:
@@ -320,6 +343,8 @@ By default, the daemon:
 
 - connects to ActivityWatch at `localhost:5600`
 - listens for pi extension events on `127.0.0.1:5667`
+- does not generate activity heartbeats; those are sampled and scheduled by the pi extension
+- runs a 10-second abandoned-session sweep; after 300 seconds without an agent signal, it archives agents that crash or are force-killed
 
 Check daemon status:
 
@@ -374,6 +399,8 @@ aw-watcher-agent daemon
 
 - 连接到 `localhost:5600` 上的 ActivityWatch
 - 在 `127.0.0.1:5667` 监听 pi 扩展事件
+- 不自行生成活动 heartbeat，heartbeat 由 pi 扩展采样并定时上报
+- 每 10 秒扫描一次 abandoned session；agent 连续 300 秒没有信号时归档崩溃或被强制终止的 agent
 
 检查 daemon 状态：
 
@@ -417,11 +444,16 @@ aw-watcher-agent --host localhost --port 5600 daemon
 
 ## Resume behavior
 
-When a pi session is resumed, the extension records only usage produced after the resume point. Existing historical messages in the resumed session file are not counted again.
+When a pi session is resumed, the extension creates a new `session_instance_id`
+and records only usage produced after the resume point. Existing historical
+messages in the resumed session file are not counted again. Summing summaries
+with the same logical `session_id` gives the total across resumed instances.
 
 ## Resume 行为
 
-当 pi session 被 resume 时，扩展只记录 resume 之后新增的用量。resume 前已经存在于 session 文件中的历史消息不会被重复计入。
+当 pi session 被 resume 时，扩展会创建新的 `session_instance_id`，只记录 resume
+之后新增的用量；resume 前已经存在于 session 文件中的历史消息不会被重复计入。
+按相同逻辑 `session_id` 汇总多个 summary，即可得到跨 resume 实例的总量。
 
 ---
 

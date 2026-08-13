@@ -1,9 +1,9 @@
 //! 后台 daemon HTTP ingest 服务。
 //!
 //! 各类 code agent 扩展通过 HTTP POST 会话事件到本 daemon。daemon 内部按
-//! `(code_agent, session_id)` 维护单个会话，再将同一时间活跃的会话合并成
-//! 一个 ActivityWatch heartbeat 写入 event bucket；单个会话结束或超时时，
-//! 另写一条 summary event 到 sum bucket。
+//! `(code_agent, session_id, session_instance_id)` 维护单个运行实例，再将同一时间
+//! 活跃的会话合并成一个 ActivityWatch heartbeat 写入 event bucket；单个会话结束
+//! 或超时时，另写一条 summary event 到 sum bucket。
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
@@ -26,7 +26,7 @@ use serde_json::{Map, Value};
 use tokio::{
     sync::{mpsc, oneshot},
     task,
-    time::{interval, sleep, timeout, MissedTickBehavior},
+    time::{interval, timeout, MissedTickBehavior},
 };
 use tracing::{error, info, warn};
 
@@ -43,7 +43,8 @@ use crate::{
 /// AW heartbeat pulsetime：连续两次心跳之间的最大可接受间隔。
 const PULSETIME_SECS: f64 = 25.0;
 /// 会话最近一次活跃信号在该窗口内时，会进入合并后的实时状态。
-const ACTIVE_TTL_SECS: i64 = 50;
+/// 与 pulsetime 对齐，避免 summary 把 AW 已拆开的 25s 以上间隔算作连续活动。
+const ACTIVE_TTL_SECS: i64 = 25;
 /// 活跃过但长时间没有 end 的 session 会被写成 abandoned summary。
 const ABANDON_TIMEOUT_SECS: i64 = 300;
 /// abandoned session 扫描间隔。
@@ -56,13 +57,8 @@ const SESSION_COMMAND_BUFFER: usize = 1024;
 const EMITTED_SUMMARY_ID_LIMIT: usize = 10_000;
 /// /health 不应被 actor 内部慢写入长时间拖住。
 const HEALTH_STATS_TIMEOUT_MS: u64 = 200;
-/// abandoned summary 写入失败轮数上限；每轮内部仍受 MAX_RETRIES 约束。
+/// abandoned summary 写入失败轮数上限。
 const ABANDONED_SUMMARY_MAX_FAILURES: u32 = 10;
-
-/// AW 写入最大重试次数。
-const MAX_RETRIES: u32 = 3;
-/// 初始退避延迟（毫秒）。
-const INITIAL_BACKOFF_MS: u64 = 100;
 
 #[derive(Clone)]
 struct AppState {
@@ -123,7 +119,6 @@ fn abandon_timeout() -> TimeDelta {
     TimeDelta::seconds(ABANDON_TIMEOUT_SECS)
 }
 
-/// 启动 daemon。
 pub async fn run_daemon(
     client: WatcherClient,
     buckets: BucketManager,
@@ -248,8 +243,8 @@ impl SessionActor {
         while let Some(command) = rx.recv().await {
             match command {
                 SessionCommand::Start(req) => self.handle_start(req).await,
-                SessionCommand::Update(req) => self.handle_update(req),
-                SessionCommand::Heartbeat(req) => self.handle_heartbeat(req),
+                SessionCommand::Update(req) => self.handle_update(req).await,
+                SessionCommand::Heartbeat(req) => self.handle_heartbeat(req).await,
                 SessionCommand::End(req, done) => {
                     let _ = done.send(self.handle_end(req).await);
                 }
@@ -268,11 +263,20 @@ impl SessionActor {
     }
 
     async fn handle_start(&mut self, req: SessionStartRequest) {
-        let key = SessionKey::new(req.code_agent.clone(), req.session_id.clone());
+        let key = req.key();
         info!(
-            "Session start queued: id={} agent={} project={}",
-            key.session_id, key.code_agent, req.project_dir
+            "Session start queued: id={} instance={:?} agent={} project={}",
+            key.session_id, key.session_instance_id, key.code_agent, req.project_dir
         );
+
+        // 带实例 ID 的 start 可能只是 HTTP 重试；保持原状态而不是制造
+        // duplicate_start summary。旧客户端没有实例 ID 时继续使用旧行为。
+        if key.session_instance_id.is_some() {
+            if let Some(session) = self.sessions.get_mut(&key) {
+                session.apply_start(req);
+                return;
+            }
+        }
 
         if let Some(mut old_session) = self.sessions.remove(&key) {
             if old_session.has_been_active() {
@@ -293,48 +297,79 @@ impl SessionActor {
         self.sessions.insert(key, session);
     }
 
-    fn handle_update(&mut self, req: SessionUpdateRequest) {
+    async fn handle_update(&mut self, req: SessionUpdateRequest) {
         let key = req.key();
-        let now = Utc::now();
+        let activity_at = req.active_at.unwrap_or_else(Utc::now);
+        let requested_active = req.active;
         let active_ttl = active_ttl();
-        let mut should_emit_heartbeat = false;
+        let mut heartbeat_session = None;
+        let mut activity_closed = false;
 
         if let Some(session) = self.sessions.get_mut(&key) {
-            let was_active = session.is_active_at(now, active_ttl);
-            if was_active {
-                session.mark_active(now, active_ttl);
-                should_emit_heartbeat = true;
-            }
+            let was_active = session.is_active_at(activity_at, active_ttl);
             session.apply_update(req);
+
+            match requested_active {
+                Some(false) if was_active => {
+                    // active_at 是 agent_settled 的采样时间，精确关闭当前片段。
+                    session.mark_active(activity_at, active_ttl);
+                    heartbeat_session = Some(session.clone());
+                    session.finish_active_period_at(activity_at);
+                    activity_closed = true;
+                }
+                Some(false) => {
+                    // heartbeat 已超过 TTL 时只关闭到最后一次有效采样，不补齐空档。
+                    session.finish_active_period();
+                }
+                Some(true) => {
+                    session.mark_active(activity_at, active_ttl);
+                    heartbeat_session = Some(session.clone());
+                }
+                None => {}
+            }
             info!(
-                "Session update merged: {}/{}",
-                key.code_agent, key.session_id
+                "Session update merged: {}/{} instance={:?}",
+                key.code_agent, key.session_id, key.session_instance_id
             );
         } else {
             warn!(
-                "Session update ignored for unknown session={}/{}",
-                key.code_agent, key.session_id
+                "Session update ignored for unknown session={}/{} instance={:?}",
+                key.code_agent, key.session_id, key.session_instance_id
             );
         }
 
-        if should_emit_heartbeat {
-            self.spawn_aggregate_heartbeat(None);
+        if let Some(session) = heartbeat_session.as_ref() {
+            if let Err(err) = self
+                .write_aggregate_heartbeat(activity_at, Some(session))
+                .await
+            {
+                warn!("Aggregate heartbeat after session update failed: {}", err);
+            }
+        }
+        if activity_closed {
+            // 同一采样时刻写入关闭后的聚合状态，避免并发 session 的下一段出现空档。
+            if let Err(err) = self.write_aggregate_heartbeat(activity_at, None).await {
+                warn!("Aggregate heartbeat after activity close failed: {}", err);
+            }
         }
     }
 
-    fn handle_heartbeat(&mut self, req: SessionHeartbeatRequest) {
+    async fn handle_heartbeat(&mut self, req: SessionHeartbeatRequest) {
         let key = req.key();
+        let heartbeat_at = req.heartbeat_at.unwrap_or_else(Utc::now);
         if let Some(session) = self.sessions.get_mut(&key) {
-            session.mark_active(Utc::now(), active_ttl());
+            session.mark_active(heartbeat_at, active_ttl());
             info!(
-                "Heartbeat merged for session {}/{}",
-                key.code_agent, key.session_id
+                "Heartbeat merged for session {}/{} instance={:?}",
+                key.code_agent, key.session_id, key.session_instance_id
             );
-            self.spawn_aggregate_heartbeat(None);
+            if let Err(err) = self.write_aggregate_heartbeat(heartbeat_at, None).await {
+                warn!("Aggregate heartbeat failed: {}", err);
+            }
         } else {
             warn!(
-                "Heartbeat ignored for unknown session={}/{}",
-                key.code_agent, key.session_id
+                "Heartbeat ignored for unknown session={}/{} instance={:?}",
+                key.code_agent, key.session_id, key.session_instance_id
             );
         }
     }
@@ -347,8 +382,8 @@ impl SessionActor {
 
         let Some(current) = self.sessions.get(&key) else {
             warn!(
-                "Session end: unknown session={}/{}",
-                key.code_agent, key.session_id
+                "Session end: unknown session={}/{} instance={:?}",
+                key.code_agent, key.session_id, key.session_instance_id
             );
             return Err(CommandError {
                 status: StatusCode::NOT_FOUND,
@@ -360,17 +395,25 @@ impl SessionActor {
         let was_active = session.is_active_at(ended_at, active_ttl);
         if was_active {
             session.mark_active(ended_at, active_ttl);
+        } else {
+            session.finish_active_period();
         }
         session.apply_end(req);
 
         if was_active {
-            self.spawn_aggregate_heartbeat(Some(&session));
+            if let Err(err) = self
+                .write_aggregate_heartbeat(ended_at, Some(&session))
+                .await
+            {
+                warn!("Final aggregate heartbeat failed: {}", err);
+            }
         }
 
         info!(
-            "Session end: {}/{} active_duration={}s wall_duration={}s",
+            "Session end: {}/{} instance={:?} active_duration={}s wall_duration={}s",
             session.key.code_agent,
             session.key.session_id,
+            session.key.session_instance_id,
             session.active_duration().num_seconds(),
             session.wall_duration_until(ended_at).num_seconds()
         );
@@ -391,6 +434,11 @@ impl SessionActor {
             })?;
 
         self.sessions.remove(&key);
+        if was_active {
+            if let Err(err) = self.write_aggregate_heartbeat(ended_at, None).await {
+                warn!("Post-end aggregate heartbeat failed: {}", err);
+            }
+        }
         Ok(SessionResponse::ok(session_id))
     }
 
@@ -478,6 +526,8 @@ impl SessionActor {
         reason: &'static str,
     ) -> Result<()> {
         let key = session.key.clone();
+        // session update 会持续保存累计 usage，因此 abandoned summary 也尽量
+        // 输出 daemon 最后收到的快照，而不是无条件丢弃用量。
         let summary = session.summary_event("abandoned", ended_at, Some(reason));
         self.write_summary_event_once(&summary, &key).await
     }
@@ -495,7 +545,7 @@ impl SessionActor {
             return Ok(());
         }
 
-        send_summary_event_with_retry(
+        send_summary_event(
             Arc::clone(&self.client),
             self.sum_bucket_id.clone(),
             event.clone(),
@@ -522,25 +572,27 @@ impl SessionActor {
         }
     }
 
-    fn spawn_aggregate_heartbeat(&self, override_session: Option<&ActiveSession>) {
-        let Some(event) = self.build_aggregate_heartbeat_event(override_session) else {
-            return;
+    async fn write_aggregate_heartbeat(
+        &self,
+        at: DateTime<Utc>,
+        override_session: Option<&ActiveSession>,
+    ) -> Result<()> {
+        let Some(event) = self.build_aggregate_heartbeat_event(at, override_session) else {
+            return Ok(());
         };
-        let client = Arc::clone(&self.client);
-        let bucket_id = self.event_bucket_id.clone();
-
-        tokio::spawn(async move {
-            if let Err(err) = send_aggregate_heartbeat_with_retry(client, bucket_id, event).await {
-                warn!("Aggregate heartbeat failed: {}", err);
-            }
-        });
+        send_aggregate_heartbeat(
+            Arc::clone(&self.client),
+            self.event_bucket_id.clone(),
+            event,
+        )
+        .await
     }
 
     fn build_aggregate_heartbeat_event(
         &self,
+        at: DateTime<Utc>,
         override_session: Option<&ActiveSession>,
     ) -> Option<Event> {
-        let now = Utc::now();
         let active_ttl = active_ttl();
         let mut sessions: Vec<&ActiveSession> = self
             .sessions
@@ -552,7 +604,7 @@ impl SessionActor {
                     }
                     _ => session,
                 };
-                session.is_active_at(now, active_ttl).then_some(session)
+                session.is_active_at(at, active_ttl).then_some(session)
             })
             .collect();
 
@@ -565,11 +617,12 @@ impl SessionActor {
                 .code_agent
                 .cmp(&b.key.code_agent)
                 .then(a.key.session_id.cmp(&b.key.session_id))
+                .then(a.key.session_instance_id.cmp(&b.key.session_instance_id))
         });
 
         Some(Event {
             id: None,
-            timestamp: now,
+            timestamp: at,
             duration: TimeDelta::zero(),
             data: aggregate_to_aw_data(&sessions),
         })
@@ -599,80 +652,27 @@ async fn run_abandoned_session_sweeper(session_tx: mpsc::Sender<SessionCommand>)
     }
 }
 
-async fn send_aggregate_heartbeat_with_retry(
+async fn send_aggregate_heartbeat(
     client: Arc<WatcherClient>,
     bucket_id: String,
     event: Event,
 ) -> Result<()> {
-    let mut delay = Duration::from_millis(INITIAL_BACKOFF_MS);
-    for attempt in 1..=MAX_RETRIES {
-        let result = {
-            let client = Arc::clone(&client);
-            let bucket_id = bucket_id.clone();
-            let event = event.clone();
-            task::spawn_blocking(move || client.heartbeat(&bucket_id, &event, PULSETIME_SECS))
-                .await
-                .context("aggregate heartbeat task join")?
-        };
-
-        match result {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt < MAX_RETRIES => {
-                warn!(
-                    "Aggregate heartbeat retry {}/{}: {}",
-                    attempt, MAX_RETRIES, e
-                );
-                sleep(delay).await;
-                delay *= 2;
-            }
-            Err(e) => return Err(e.context("aggregate heartbeat")),
-        }
-    }
-
-    Err(anyhow!("aggregate heartbeat retry loop exhausted"))
+    task::spawn_blocking(move || client.heartbeat(&bucket_id, &event, PULSETIME_SECS))
+        .await
+        .context("aggregate heartbeat task join")?
+        .context("aggregate heartbeat")
 }
 
-async fn send_summary_event_with_retry(
+async fn send_summary_event(
     client: Arc<WatcherClient>,
     bucket_id: String,
     event: Event,
     key: &SessionKey,
 ) -> Result<()> {
-    let mut delay = Duration::from_millis(INITIAL_BACKOFF_MS);
-    for attempt in 1..=MAX_RETRIES {
-        let result = {
-            let client = Arc::clone(&client);
-            let bucket_id = bucket_id.clone();
-            let event = event.clone();
-            task::spawn_blocking(move || client.insert_event(&bucket_id, &event))
-                .await
-                .context("summary event task join")?
-        };
-
-        match result {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt < MAX_RETRIES => {
-                warn!(
-                    "Summary event retry {}/{} for {}/{}: {}",
-                    attempt, MAX_RETRIES, key.code_agent, key.session_id, e
-                );
-                sleep(delay).await;
-                delay *= 2;
-            }
-            Err(e) => {
-                return Err(e.context(format!(
-                    "summary event for {}/{}",
-                    key.code_agent, key.session_id
-                )))
-            }
-        }
-    }
-
-    Err(anyhow!(
-        "summary event retry loop exhausted for {}/{}",
-        key.code_agent,
-        key.session_id
-    ))
+    task::spawn_blocking(move || client.insert_event(&bucket_id, &event))
+        .await
+        .context("summary event task join")?
+        .with_context(|| format!("summary event for {}/{}", key.code_agent, key.session_id))
 }
 
 fn aggregate_to_aw_data(sessions: &[&ActiveSession]) -> Map<String, Value> {
@@ -737,6 +737,12 @@ fn aggregate_to_aw_data(sessions: &[&ActiveSession]) -> Map<String, Value> {
                 "session_id".into(),
                 Value::String(session.key.session_id.clone()),
             );
+            if let Some(instance_id) = &session.key.session_instance_id {
+                item.insert(
+                    "session_instance_id".into(),
+                    Value::String(instance_id.clone()),
+                );
+            }
             item.insert(
                 "project".into(),
                 Value::String(session.project_name.clone()),

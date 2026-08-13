@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "aw-watcher-agent"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "aw-client-rust",
@@ -131,7 +131,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ts-rs",
- "url",
  "uuid",
 ]
 

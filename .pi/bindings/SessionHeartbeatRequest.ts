@@ -3,4 +3,8 @@
 /**
  * 会话心跳请求。由扩展周期性发送，表示该 session 仍然活跃。
  */
-export type SessionHeartbeatRequest = { session_id: string, code_agent: string, };
+export type SessionHeartbeatRequest = { session_id: string, session_instance_id: string | null, code_agent: string,
+/**
+ * heartbeat 在 agent 侧的采样时间；旧客户端缺失时回退到 daemon 接收时间。
+ */
+heartbeat_at: string | null, };
