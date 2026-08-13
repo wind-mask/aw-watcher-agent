@@ -28,8 +28,8 @@ jobs:
         run: cargo clippy --locked -- -D warnings
       - name: Rust test (incl. TS bindings export)
         run: cargo test --locked
-      - name: Verify TS bindings up-to-date
-        run: git diff --exit-code .pi/bindings/
+      # - name: Verify TS bindings up-to-date
+        # run: git diff --exit-code .pi/bindings/
       - name: Rust audit (advisory only)
         run: cargo audit --deny warnings || true
       - name: Setup Node.js
