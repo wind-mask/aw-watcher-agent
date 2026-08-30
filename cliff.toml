@@ -56,9 +56,9 @@ filter_unconventional = true
 
 # Split commits on newlines
 split_commits = false
-
 # Preprocessors to normalize commit messages before parsing
 commit_preprocessors = [
+  { pattern = ' *(:\w+:|[\p{Emoji_Presentation}\p{Extended_Pictographic}\u{200D}]) *', replace = "" },
     # Strip gitmoji emoji prefix (used by cz-gitmoji)
     # Matches non-word/non-digit characters at the start followed by whitespace
     { pattern = '^[^\w\d]+\s+', replace = "" },
