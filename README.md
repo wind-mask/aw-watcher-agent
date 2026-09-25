@@ -173,10 +173,17 @@ than one model produced usage); `selected_model` records the model selected
 for the session. Usage snapshots are cumulative per instance, and top-level
 token/cost totals are derived from `model_usage` so they always match it.
 
-Sessions that were active but timed out before an end event are written to
-the sum bucket with `"status": "abandoned"` and `"reason": "timeout"` (or
-`"reason": "duplicate_start"` / `"shutdown"`). Abandoned summaries keep the
-last usage snapshot received before the timeout.
+Sessions that stay idle are not dropped: the state is kept, and new heartbeats simply
+continue the same instance. Once a session has been idle past the dormant-report
+threshold (30 minutes by default), the daemon writes an `"status": "abandoned"` /
+`"reason": "timeout"` summary with `"revivable": true` and keeps tracking it. If the
+session later resumes, the follow-up summary only covers the new segment: usage and
+`active_duration_seconds` are deltas relative to the previous summary, `started_at`
+points at the continuation start, and `continuation_of` links back to the previous
+`summary_id`. Summaries also carry `"reason": "duplicate_start"` / `"shutdown"`, and
+an end request for a session the daemon no longer tracks (daemon restart or expired
+retention) is still accepted with HTTP 200 and written best-effort as
+`"reason": "late_end"` with `"metadata": {"orphan": true}`.
 
 ## ActivityWatch 数据模型
 
@@ -265,9 +272,15 @@ usage：
 `selected_model` 记录会话当前选中的模型。usage 快照按实例累计，顶层
 token/cost 由 `model_usage` 汇总得到，两者始终一致。
 
-活跃过但未收到 end 事件的 session 会以 `"status": "abandoned"` 和
-`"reason": "timeout"`（或 `"reason": "duplicate_start"` / `"shutdown"`）写入
-sum bucket；abandoned summary 会保留超时前最后收到的 usage 快照。
+空闲的 session 不会被丢弃：daemon 保留会话状态，后续心跳会继续同一实例。当空闲
+超过 dormant 上报阈值（默认 30 分钟）时，先以 `"status": "abandoned"` /
+`"reason": "timeout"` 写一份带 `"revivable": true` 的 summary，并继续保留状态；
+session 之后如果又继续活跃，续接 summary 只覆盖新增片段：usage 与
+`active_duration_seconds` 都是相对上一份 summary 的增量，`started_at` 指向续接
+起点，`continuation_of` 指回上一份 `summary_id`。另有 `"reason": "duplicate_start"`
+与 `"shutdown"`。对于 daemon 重启或超过保留期后已无状态的会话，end 请求不再返回
+404：daemon 返回 200，并尽力以 `"reason": "late_end"` /
+`"metadata": {"orphan": true}` 写出一份保留结尾 usage 的孤儿 summary。
 
 ---
 ## Installation
@@ -344,7 +357,7 @@ By default, the daemon:
 - connects to ActivityWatch at `localhost:5600`
 - listens for pi extension events on `127.0.0.1:5667`
 - does not generate activity heartbeats; those are sampled and scheduled by the pi extension
-- runs a 10-second abandoned-session sweep; after 300 seconds without an agent signal, it archives agents that crash or are force-killed
+- runs a dormant-session sweep (10-second interval by default); a session idle past `--idle-secs` (300s) stops counting as active but keeps its state, is summarized as `revivable` after `--report-secs` (1800s), and is only dropped after `--retention-secs` (86400s)
 
 Check daemon status:
 
@@ -400,7 +413,7 @@ aw-watcher-agent daemon
 - 连接到 `localhost:5600` 上的 ActivityWatch
 - 在 `127.0.0.1:5667` 监听 pi 扩展事件
 - 不自行生成活动 heartbeat，heartbeat 由 pi 扩展采样并定时上报
-- 每 10 秒扫描一次 abandoned session；agent 连续 300 秒没有信号时归档崩溃或被强制终止的 agent
+- 定时扫描 dormant session（默认 10 秒一次）；空闲超过 `--idle-secs`（300 秒）后不再计入实时活动但保留状态，超过 `--report-secs`（1800 秒）先写一份 `revivable` summary，仅在超过 `--retention-secs`（86400 秒）后才丢弃状态
 
 检查 daemon 状态：
 

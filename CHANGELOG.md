@@ -2,24 +2,70 @@
 
 All notable changes to this project will be documented in this file.
 
+## [unreleased]
 
-## [0.1.6](https://github.com/wind-mask/aw-watcher-agent/releases/tag/v0.1.6) - 2026-08-13
+### 🐛 Bug Fixes
 
-### Fixed
+- *(daemon)* 空闲会话休眠续接，end 不再返回 404空闲会话休眠续接，end 不再返回 404
 
-- 修复 Rust ActivityWatch 客户端编译错误，daemon 直接使用已有 `aw-client-rust`。
-- 活动时间以 Pi 扩展 heartbeat、settled 和 end 的采样时间为准，daemon 不再自行生成周期性 heartbeat。
-- 保留 abandoned sweeper，用于 agent 崩溃或强制中断后归档未结束 session。
-- 统一累计 usage 与实际 model usage，区分实际使用模型和 `selected_model`。
-- Pi resume/reload 使用独立 `session_instance_id`，并记录手动 compact/tree 产生的 usage。
+### 💼 Other
 
+- *(cliff)* Fix cliffFix cliff by @wind-mask
+## [0.1.6] - 2026-08-13
 
-## [0.1.0](https://github.com/wind-mask/aw-watcher-agent/releases/tag/v0.1.0) - 2026-04-27
+### 🚀 Features
 
-### Added
+- Track session instances and sampled usageTrack session instances and sampled usage by @wind-mask
 
-- initial aw-watcher-agent release
+### ⚙️ Miscellaneous Tasks
 
-### Other
+- *(ci)* FixFix by @wind-mask
+## [0.1.5] - 2026-05-21
 
-- 🔧 chore: add project management tooling
+### 🚀 Features
+
+- Split ActivityWatch buckets and add migrationSplit ActivityWatch buckets and add migration by @wind-mask
+
+### 🐛 Bug Fixes
+
+- Align pi session id trackingAlign pi session id tracking by @wind-mask
+## [0.1.3] - 2026-04-27
+
+### 🚀 Features
+
+- Switch crates.io publish to Trusted Publishers (OIDC)Switch crates.io publish to Trusted Publishers (OIDC) by @wind-mask
+- *(heartbeat)* Pi 扩展 heartbeatPi 扩展 heartbeat by @wind-mask
+## [0.1.2] - 2026-04-27
+
+### 🚀 Features
+
+- Enable crates.io publishing via release-plzEnable crates.io publishing via release-plz by @wind-mask
+- Full auto-release on manual tag pushFull auto-release on manual tag push by @wind-mask
+
+### 🚜 Refactor
+
+- Remove release-plz, switch to manual tag workflowRemove release-plz, switch to manual tag workflow by @wind-mask
+
+### ⚙️ Miscellaneous Tasks
+
+- Add include list for cargo packageAdd include list for cargo package by @wind-mask
+## [0.1.1] - 2026-04-27
+
+### ⚙️ Miscellaneous Tasks
+
+- Bump version to 0.1.1Bump version to 0.1.1 by @wind-mask
+## [0.1.0] - 2026-04-27
+
+### 🚀 Features
+
+- Initial aw-watcher-agent releaseInitial aw-watcher-agent release by @wind-mask
+
+### 🐛 Bug Fixes
+
+- Align aw-client-rust API calls with crates.io v0.1.0Align aw-client-rust API calls with crates.io v0.1.0 by @wind-mask
+
+### ⚙️ Miscellaneous Tasks
+
+- Add project management toolingAdd project management tooling by @wind-mask
+- Release v0.1.0Release v0.1.0 by @github-actions[bot]
+- Switch npm publish to Trusted Publishers (OIDC)Switch npm publish to Trusted Publishers (OIDC) by @wind-mask

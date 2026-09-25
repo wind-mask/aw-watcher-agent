@@ -17,7 +17,10 @@ use tracing::info;
 
 use buckets::BucketManager;
 use client::{WatcherClient, DEFAULT_PORT};
-use daemon::run_daemon;
+use daemon::{
+    run_daemon, LifecyclePolicy, DEFAULT_DORMANT_IDLE_SECS, DEFAULT_DORMANT_REPORT_SECS,
+    DEFAULT_DORMANT_RETENTION_SECS,
+};
 
 fn default_daemon_listen() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 5667))
@@ -48,6 +51,18 @@ enum Commands {
         /// daemon 监听地址
         #[arg(long, default_value_t = default_daemon_listen())]
         listen: SocketAddr,
+
+        /// 空闲多少秒后不再计入实时活动（保留会话状态，收到新事件会续接）
+        #[arg(long, default_value_t = DEFAULT_DORMANT_IDLE_SECS)]
+        idle_secs: i64,
+
+        /// dormant 多少秒后先写一份 abandoned summary（状态继续保留）
+        #[arg(long, default_value_t = DEFAULT_DORMANT_REPORT_SECS)]
+        report_secs: i64,
+
+        /// dormant 会话状态最长保留多少秒
+        #[arg(long, default_value_t = DEFAULT_DORMANT_RETENTION_SECS)]
+        retention_secs: i64,
     },
 
     /// 删除 watcher 创建的 event/sum bucket
@@ -73,6 +88,9 @@ async fn main() -> Result<()> {
     let port = cli.port;
     let command = cli.command.unwrap_or(Commands::Daemon {
         listen: default_daemon_listen(),
+        idle_secs: DEFAULT_DORMANT_IDLE_SECS,
+        report_secs: DEFAULT_DORMANT_REPORT_SECS,
+        retention_secs: DEFAULT_DORMANT_RETENTION_SECS,
     });
 
     // 避免 daemon 与临时 CLI 命令争用 aw-client-rust 的 single-instance lock。
@@ -89,9 +107,15 @@ async fn main() -> Result<()> {
 
     let buckets = BucketManager::new(&client);
     match command {
-        Commands::Daemon { listen } => {
+        Commands::Daemon {
+            listen,
+            idle_secs,
+            report_secs,
+            retention_secs,
+        } => {
+            let policy = LifecyclePolicy::from_secs(idle_secs, report_secs, retention_secs)?;
             info!("Starting daemon on {}", listen);
-            run_daemon(client, buckets, listen).await?;
+            run_daemon(client, buckets, listen, policy).await?;
         }
         Commands::Teardown => {
             info!("Tearing down buckets");

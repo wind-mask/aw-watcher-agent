@@ -34,8 +34,8 @@ use crate::{
     buckets::BucketManager,
     client::WatcherClient,
     events::{
-        ActiveSession, SessionEndRequest, SessionHeartbeatRequest, SessionKey, SessionStartRequest,
-        SessionUpdateRequest,
+        orphan_summary_event, ActiveSession, SessionEndRequest, SessionHeartbeatRequest,
+        SessionKey, SessionStartRequest, SessionUpdateRequest,
     },
     shutdown_signal::wait_for_shutdown_signal,
 };
@@ -45,9 +45,13 @@ const PULSETIME_SECS: f64 = 25.0;
 /// 会话最近一次活跃信号在该窗口内时，会进入合并后的实时状态。
 /// 与 pulsetime 对齐，避免 summary 把 AW 已拆开的 25s 以上间隔算作连续活动。
 const ACTIVE_TTL_SECS: i64 = 25;
-/// 活跃过但长时间没有 end 的 session 会被写成 abandoned summary。
-const ABANDON_TIMEOUT_SECS: i64 = 300;
-/// abandoned session 扫描间隔。
+/// 默认空闲阈值：超过后不再算作活跃，但会话状态保留以便续接。
+pub const DEFAULT_DORMANT_IDLE_SECS: i64 = 300;
+/// 默认 dormant 上报阈值：空闲超过该时长先写一份 abandoned summary，状态继续保留。
+pub const DEFAULT_DORMANT_REPORT_SECS: i64 = 1800;
+/// 默认 dormant 保留期：超过后丢弃会话状态（此时 summary 已写出）。
+pub const DEFAULT_DORMANT_RETENTION_SECS: i64 = 86_400;
+/// dormant 扫描间隔上限；空闲阈值更小时按比例收缩。
 const SWEEP_INTERVAL_SECS: u64 = 10;
 /// HTTP 请求体最大大小。扩展只上报会话级结构化数据，但给 metadata 留出余量。
 const BODY_LIMIT_BYTES: usize = 256 * 1024;
@@ -59,6 +63,71 @@ const EMITTED_SUMMARY_ID_LIMIT: usize = 10_000;
 const HEALTH_STATS_TIMEOUT_MS: u64 = 200;
 /// abandoned summary 写入失败轮数上限。
 const ABANDONED_SUMMARY_MAX_FAILURES: u32 = 10;
+/// 内存中保留状态的会话数量上限，超出时优先丢弃已上报且最久空闲的会话。
+const MAX_TRACKED_SESSIONS: usize = 512;
+
+/// 会话生命周期策略。
+///
+/// 空闲超过 `idle` 后会话只是不再计入实时活动，状态仍会保留：dormant 期间收到的
+/// 心跳/更新会重新激活它（超过 TTL 的空档不会计入活跃时长）。只有超过 `retention`
+/// 才真正丢弃状态，因此 daemon 不会因为用户暂停几分钟而丢失后续活动。
+#[derive(Debug, Clone, Copy)]
+pub struct LifecyclePolicy {
+    /// 空闲超过该时长即视为 dormant。
+    pub idle: TimeDelta,
+    /// dormant 超过该时长后写出一份 abandoned summary（保留状态以便续接）。
+    pub report: TimeDelta,
+    /// dormant 状态最长保留时间。
+    pub retention: TimeDelta,
+}
+
+impl Default for LifecyclePolicy {
+    fn default() -> Self {
+        Self {
+            idle: TimeDelta::seconds(DEFAULT_DORMANT_IDLE_SECS),
+            report: TimeDelta::seconds(DEFAULT_DORMANT_REPORT_SECS),
+            retention: TimeDelta::seconds(DEFAULT_DORMANT_RETENTION_SECS),
+        }
+    }
+}
+
+impl LifecyclePolicy {
+    /// 由 CLI 秒数构造并校验阈值关系。
+    pub fn from_secs(idle: i64, report: i64, retention: i64) -> Result<Self> {
+        if idle <= 0 || report <= 0 || retention <= 0 {
+            return Err(anyhow!("idle/report/retention 阈值必须为正数"));
+        }
+        if report < idle {
+            return Err(anyhow!("dormant 上报阈值不能小于空闲阈值"));
+        }
+        if retention < report {
+            return Err(anyhow!("dormant 保留期不能小于上报阈值"));
+        }
+        Ok(Self {
+            idle: TimeDelta::seconds(idle),
+            report: TimeDelta::seconds(report),
+            retention: TimeDelta::seconds(retention),
+        })
+    }
+
+    /// 扫描间隔：默认 10s，空闲阈值更小时按 1/3 收缩（便于测试与调参）。
+    fn sweep_interval(&self) -> Duration {
+        let ceiling = Duration::from_secs(SWEEP_INTERVAL_SECS).as_millis() as i64;
+        let scaled = (self.idle / 3).num_milliseconds().clamp(200, ceiling);
+        Duration::from_millis(scaled as u64)
+    }
+}
+
+/// `/health` 返回的会话计数。
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+struct SessionStats {
+    /// 仍在活跃窗口内的会话数。
+    active: usize,
+    /// 已活跃过但当前 dormant 的会话数。
+    dormant: usize,
+    /// 内存中保留状态的会话总数。
+    tracked: usize,
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -74,6 +143,8 @@ struct HealthResponse {
     event_bucket_id: String,
     sum_bucket_id: String,
     active_sessions: usize,
+    dormant_sessions: usize,
+    tracked_sessions: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -108,23 +179,34 @@ enum SessionCommand {
         reason: &'static str,
         done: oneshot::Sender<()>,
     },
-    Stats(oneshot::Sender<usize>),
+    Stats(oneshot::Sender<SessionStats>),
 }
 
 fn active_ttl() -> TimeDelta {
     TimeDelta::seconds(ACTIVE_TTL_SECS)
 }
 
-fn abandon_timeout() -> TimeDelta {
-    TimeDelta::seconds(ABANDON_TIMEOUT_SECS)
-}
-
 pub async fn run_daemon(
     client: WatcherClient,
     buckets: BucketManager,
     listen: SocketAddr,
+    policy: LifecyclePolicy,
 ) -> Result<()> {
     buckets.setup(&client)?;
+    info!(
+        "Session lifecycle: idle={}s dormant_report={}s retention={}s",
+        policy.idle.num_seconds(),
+        policy.report.num_seconds(),
+        policy.retention.num_seconds()
+    );
+    if policy.idle < active_ttl() {
+        warn!(
+            "idle 阈值 {}s 小于 aw-server pulsetime TTL ({}s)：dormant 空档可能仍被 AW 脉冲延伸，建议不小于 {}s",
+            policy.idle.num_seconds(),
+            ACTIVE_TTL_SECS,
+            ACTIVE_TTL_SECS
+        );
+    }
 
     let client = Arc::new(client);
     let (session_tx, session_rx) = mpsc::channel(SESSION_COMMAND_BUFFER);
@@ -133,7 +215,12 @@ pub async fn run_daemon(
         event_bucket_id: buckets.event_bucket_id.clone(),
         sum_bucket_id: buckets.sum_bucket_id.clone(),
     };
-    let actor = SessionActor::new(client, buckets.event_bucket_id, buckets.sum_bucket_id);
+    let actor = SessionActor::new(
+        client,
+        buckets.event_bucket_id,
+        buckets.sum_bucket_id,
+        policy,
+    );
     let mut actor_task = tokio::spawn(actor.run(session_rx));
 
     let app = Router::new()
@@ -151,7 +238,10 @@ pub async fn run_daemon(
 
     info!("aw-watcher-agent daemon listening on http://{}", listen);
 
-    let sweeper = tokio::spawn(run_abandoned_session_sweeper(state.session_tx.clone()));
+    let sweeper = tokio::spawn(run_abandoned_session_sweeper(
+        state.session_tx.clone(),
+        policy.sweep_interval(),
+    ));
 
     // 优雅关闭：收到 SIGINT / SIGTERM 时将未结束但活跃过的 session 写成 abandoned。
     let shutdown_tx = state.session_tx.clone();
@@ -206,6 +296,7 @@ struct SessionActor {
     client: Arc<WatcherClient>,
     event_bucket_id: String,
     sum_bucket_id: String,
+    policy: LifecyclePolicy,
     sessions: HashMap<SessionKey, ActiveSession>,
     emitted_summary_ids: HashSet<String>,
     emitted_summary_id_order: VecDeque<String>,
@@ -228,11 +319,17 @@ fn log_actor_shutdown(result: std::result::Result<(), task::JoinError>) {
 }
 
 impl SessionActor {
-    fn new(client: Arc<WatcherClient>, event_bucket_id: String, sum_bucket_id: String) -> Self {
+    fn new(
+        client: Arc<WatcherClient>,
+        event_bucket_id: String,
+        sum_bucket_id: String,
+        policy: LifecyclePolicy,
+    ) -> Self {
         Self {
             client,
             event_bucket_id,
             sum_bucket_id,
+            policy,
             sessions: HashMap::new(),
             emitted_summary_ids: HashSet::new(),
             emitted_summary_id_order: VecDeque::new(),
@@ -254,7 +351,7 @@ impl SessionActor {
                     let _ = done.send(());
                 }
                 SessionCommand::Stats(done) => {
-                    let _ = done.send(self.sessions.len());
+                    let _ = done.send(self.session_stats());
                 }
             }
         }
@@ -279,7 +376,7 @@ impl SessionActor {
         }
 
         if let Some(mut old_session) = self.sessions.remove(&key) {
-            if old_session.has_been_active() {
+            if old_session.has_unreported_activity() {
                 let ended_at = old_session.last_active_at.unwrap_or_else(Utc::now);
                 if let Err(err) = self
                     .write_abandoned_summary(&mut old_session, ended_at, "duplicate_start")
@@ -380,18 +477,24 @@ impl SessionActor {
         let ended_at = req.ended_at.unwrap_or_else(Utc::now);
         let active_ttl = active_ttl();
 
-        let Some(current) = self.sessions.get(&key) else {
+        let Some(current) = self.sessions.get(&key).cloned() else {
+            // daemon 重启或超过保留期后状态可能已不存在：不再返回 404，
+            // 而是尽力把 end 请求里的最终 usage 写成 late_end summary。
             warn!(
-                "Session end: unknown session={}/{} instance={:?}",
+                "Session end for unknown session={}/{} instance={:?}; writing late_end summary",
                 key.code_agent, key.session_id, key.session_instance_id
             );
-            return Err(CommandError {
-                status: StatusCode::NOT_FOUND,
-                error: format!("unknown session: {}/{}", key.code_agent, key.session_id),
-            });
+            let event = orphan_summary_event(&req, ended_at);
+            if let Err(err) = self.write_summary_event_once(&event, &key).await {
+                error!(
+                    "Late end summary failed for {}/{}: {}",
+                    key.code_agent, key.session_id, err
+                );
+            }
+            return Ok(SessionResponse::ok(session_id));
         };
 
-        let mut session = current.clone();
+        let mut session = current;
         let was_active = session.is_active_at(ended_at, active_ttl);
         if was_active {
             session.mark_active(ended_at, active_ttl);
@@ -419,19 +522,27 @@ impl SessionActor {
         );
 
         let key_for_log = session.key.clone();
-        let summary = session.summary_event("completed", ended_at, None);
-        self.write_summary_event_once(&summary, &key_for_log)
-            .await
-            .map_err(|err| {
-                error!(
-                    "Summary event failed for {}/{}: {}",
-                    key_for_log.code_agent, key_for_log.session_id, err
-                );
-                CommandError {
-                    status: StatusCode::BAD_GATEWAY,
-                    error: format!("failed to write summary ActivityWatch event: {}", err),
-                }
-            })?;
+        if session.has_unreported_activity() {
+            let summary = session.summary_event("completed", ended_at, None);
+            self.write_summary_event_once(&summary, &key_for_log)
+                .await
+                .map_err(|err| {
+                    error!(
+                        "Summary event failed for {}/{}: {}",
+                        key_for_log.code_agent, key_for_log.session_id, err
+                    );
+                    CommandError {
+                        status: StatusCode::BAD_GATEWAY,
+                        error: format!("failed to write summary ActivityWatch event: {}", err),
+                    }
+                })?;
+        } else {
+            // dormant 上报已经覆盖这段活动，避免写出内容重复的 summary。
+            info!(
+                "No new activity for {}/{} instance={:?}; dormant summary already covers it",
+                key_for_log.code_agent, key_for_log.session_id, key_for_log.session_instance_id
+            );
+        }
 
         self.sessions.remove(&key);
         if was_active {
@@ -444,56 +555,147 @@ impl SessionActor {
 
     async fn handle_sweep(&mut self) {
         let now = Utc::now();
-        let timeout = abandon_timeout();
-        let keys: Vec<SessionKey> = self
-            .sessions
-            .iter()
-            .filter_map(|(key, session)| match session.last_active_at.as_ref() {
-                Some(last_active_at) if now.signed_duration_since(*last_active_at) > timeout => {
-                    Some(key.clone())
-                }
-                None if now.signed_duration_since(session.started_at) > timeout => {
-                    Some(key.clone())
-                }
-                _ => None,
-            })
-            .collect();
+        let policy = self.policy;
 
-        for key in keys {
-            if let Some(mut session) = self.sessions.remove(&key) {
-                if !session.has_been_active() {
-                    warn!(
-                        "Dropping inactive timed-out session {}/{}",
-                        session.key.code_agent, session.key.session_id
-                    );
-                    continue;
-                }
+        let mut to_report: Vec<SessionKey> = Vec::new();
+        let mut to_evict: Vec<SessionKey> = Vec::new();
 
-                let ended_at = session.last_active_at.unwrap_or(now);
-                if let Err(err) = self
-                    .write_abandoned_summary(&mut session, ended_at, "timeout")
-                    .await
-                {
+        for (key, session) in &self.sessions {
+            let idle_for = session.idle_for(now);
+            if idle_for <= policy.idle {
+                continue;
+            }
+            // 从未活跃、已写出过 summary、或反复写入失败的会话没有待上报的活动。
+            let pending_report = session.has_unreported_activity()
+                && session.abandoned_summary_failures() < ABANDONED_SUMMARY_MAX_FAILURES;
+
+            if idle_for > policy.retention {
+                if pending_report {
+                    // 保留期已到但 summary 还没写出去：先补写，下一轮再清理，避免丢数据。
+                    to_report.push(key.clone());
+                } else {
+                    to_evict.push(key.clone());
+                }
+                continue;
+            }
+            if idle_for > policy.report && pending_report {
+                to_report.push(key.clone());
+            }
+        }
+
+        for key in to_evict {
+            if self.sessions.remove(&key).is_some() {
+                info!(
+                    "Evicted dormant session {}/{} instance={:?} after {}s idle",
+                    key.code_agent,
+                    key.session_id,
+                    key.session_instance_id,
+                    policy.retention.num_seconds()
+                );
+            }
+        }
+
+        for key in to_report {
+            if let Err(err) = self.report_dormant_session(&key, now).await {
+                warn!(
+                    "Failed dormant summary for {}/{} instance={:?}: {}",
+                    key.code_agent, key.session_id, key.session_instance_id, err
+                );
+                if let Some(session) = self.sessions.get_mut(&key) {
                     let failures = session.record_abandoned_summary_failure();
                     if failures >= ABANDONED_SUMMARY_MAX_FAILURES {
                         warn!(
-                            "Dropping abandoned session {}/{} after {} failed summary write attempts: {}",
-                            session.key.code_agent, session.key.session_id, failures, err
+                            "Giving up dormant summary for {}/{} after {} failures; session state is kept",
+                            key.code_agent, key.session_id, failures
                         );
-                    } else {
-                        warn!(
-                            "Failed abandoned summary for {}/{} ({}/{}): {}",
-                            session.key.code_agent,
-                            session.key.session_id,
-                            failures,
-                            ABANDONED_SUMMARY_MAX_FAILURES,
-                            err
-                        );
-                        self.sessions.insert(key, session);
                     }
                 }
             }
         }
+
+        self.enforce_session_capacity();
+    }
+
+    /// 写出一次 dormant summary 并记住已上报快照；会话状态继续保留。
+    async fn report_dormant_session(
+        &mut self,
+        key: &SessionKey,
+        ended_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let Some(mut session) = self.sessions.get(key).cloned() else {
+            return Ok(());
+        };
+        let event = session.dormant_report_event(ended_at);
+        let summary_id = self.write_summary_event_once(&event, key).await?;
+        if let Some(current) = self.sessions.get_mut(key) {
+            current.mark_reported(summary_id);
+            current.reset_abandoned_summary_failures();
+        }
+        info!(
+            "Dormant summary written for {}/{} instance={:?} (state kept, idle={}s)",
+            key.code_agent,
+            key.session_id,
+            key.session_instance_id,
+            session.idle_for(ended_at).num_seconds()
+        );
+        Ok(())
+    }
+
+    /// 内存兜底：保留期很长，超量时优先丢弃已上报且最久空闲的会话。
+    fn enforce_session_capacity(&mut self) {
+        if self.sessions.len() <= MAX_TRACKED_SESSIONS {
+            return;
+        }
+
+        let mut candidates: Vec<(DateTime<Utc>, SessionKey)> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| !session.has_unreported_activity())
+            .map(|(key, session)| {
+                (
+                    session.last_active_at.unwrap_or(session.started_at),
+                    key.clone(),
+                )
+            })
+            .collect();
+        candidates.sort_by_key(|(idle_since, _)| *idle_since);
+
+        for (_, key) in candidates {
+            if self.sessions.len() <= MAX_TRACKED_SESSIONS {
+                break;
+            }
+            self.sessions.remove(&key);
+            info!(
+                "Evicted reported session {}/{} instance={:?} to stay under {} tracked sessions",
+                key.code_agent, key.session_id, key.session_instance_id, MAX_TRACKED_SESSIONS
+            );
+        }
+
+        if self.sessions.len() > MAX_TRACKED_SESSIONS {
+            warn!(
+                "Tracking {} sessions (>{}); unreported sessions are kept until their summary is written",
+                self.sessions.len(),
+                MAX_TRACKED_SESSIONS
+            );
+        }
+    }
+
+    /// `/health` 用的会话计数；活跃/dormant 按生命周期策略的 idle 阈值划分。
+    fn session_stats(&self) -> SessionStats {
+        let now = Utc::now();
+        let idle_window = self.policy.idle;
+        let mut stats = SessionStats {
+            tracked: self.sessions.len(),
+            ..SessionStats::default()
+        };
+        for session in self.sessions.values() {
+            if session.is_active_at(now, idle_window) {
+                stats.active += 1;
+            } else if session.has_been_active() {
+                stats.dormant += 1;
+            }
+        }
+        stats
     }
 
     async fn drain_sessions_as_abandoned(&mut self, reason: &'static str) {
@@ -501,20 +703,22 @@ impl SessionActor {
         let keys: Vec<SessionKey> = self.sessions.keys().cloned().collect();
 
         for key in keys {
-            if let Some(mut session) = self.sessions.remove(&key) {
-                if !session.has_been_active() {
-                    continue;
-                }
-                let ended_at = session.last_active_at.unwrap_or(now);
-                if let Err(err) = self
-                    .write_abandoned_summary(&mut session, ended_at, reason)
-                    .await
-                {
-                    warn!(
-                        "Failed abandoned summary for {}/{}: {}",
-                        session.key.code_agent, session.key.session_id, err
-                    );
-                }
+            let Some(mut session) = self.sessions.remove(&key) else {
+                continue;
+            };
+            // 已经写出的 summary 不再重复写，避免出现内容重复的 sum 记录。
+            if !session.has_unreported_activity() {
+                continue;
+            }
+            let ended_at = session.last_active_at.unwrap_or(now);
+            if let Err(err) = self
+                .write_abandoned_summary(&mut session, ended_at, reason)
+                .await
+            {
+                warn!(
+                    "Failed abandoned summary for {}/{}: {}",
+                    session.key.code_agent, session.key.session_id, err
+                );
             }
         }
     }
@@ -529,20 +733,26 @@ impl SessionActor {
         // session update 会持续保存累计 usage，因此 abandoned summary 也尽量
         // 输出 daemon 最后收到的快照，而不是无条件丢弃用量。
         let summary = session.summary_event("abandoned", ended_at, Some(reason));
-        self.write_summary_event_once(&summary, &key).await
+        self.write_summary_event_once(&summary, &key)
+            .await
+            .map(|_| ())
     }
 
-    async fn write_summary_event_once(&mut self, event: &Event, key: &SessionKey) -> Result<()> {
+    /// 写出 summary event（同进程内按 summary_id 去重），返回已写出的 summary_id。
+    async fn write_summary_event_once(
+        &mut self,
+        event: &Event,
+        key: &SessionKey,
+    ) -> Result<Option<String>> {
         let summary_id = summary_id_from_event(event);
-        if summary_id
-            .as_ref()
-            .is_some_and(|id| self.emitted_summary_ids.contains(id))
-        {
-            info!(
-                "Skipping duplicate summary event for {}/{}",
-                key.code_agent, key.session_id
-            );
-            return Ok(());
+        if let Some(id) = summary_id.as_ref() {
+            if self.emitted_summary_ids.contains(id) {
+                info!(
+                    "Skipping duplicate summary event for {}/{}",
+                    key.code_agent, key.session_id
+                );
+                return Ok(Some(id.clone()));
+            }
         }
 
         send_summary_event(
@@ -553,10 +763,10 @@ impl SessionActor {
         )
         .await?;
 
-        if let Some(summary_id) = summary_id {
-            self.remember_summary_id(summary_id);
+        if let Some(id) = summary_id.as_ref() {
+            self.remember_summary_id(id.clone());
         }
-        Ok(())
+        Ok(summary_id)
     }
 
     fn remember_summary_id(&mut self, summary_id: String) {
@@ -640,8 +850,11 @@ impl SessionResponse {
 
 // ---- 心跳与 summary 写入 ----
 
-async fn run_abandoned_session_sweeper(session_tx: mpsc::Sender<SessionCommand>) {
-    let mut ticker = interval(Duration::from_secs(SWEEP_INTERVAL_SECS));
+async fn run_abandoned_session_sweeper(
+    session_tx: mpsc::Sender<SessionCommand>,
+    sweep_interval: Duration,
+) {
+    let mut ticker = interval(sweep_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
@@ -781,20 +994,20 @@ fn summary_id_from_event(event: &Event) -> Option<String> {
 // ---- HTTP handlers ----
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
-    let active_sessions = match timeout(
+    let stats = match timeout(
         Duration::from_millis(HEALTH_STATS_TIMEOUT_MS),
-        actor_session_count(&state),
+        actor_session_stats(&state),
     )
     .await
     {
-        Ok(Some(count)) => count,
+        Ok(Some(stats)) => stats,
         Ok(None) => {
             warn!("Session actor unavailable while serving /health");
-            0
+            SessionStats::default()
         }
         Err(_) => {
             warn!("Session actor stats timed out while serving /health");
-            0
+            SessionStats::default()
         }
     };
 
@@ -803,7 +1016,9 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         service: "aw-watcher-agent",
         event_bucket_id: state.event_bucket_id,
         sum_bucket_id: state.sum_bucket_id,
-        active_sessions,
+        active_sessions: stats.active,
+        dormant_sessions: stats.dormant,
+        tracked_sessions: stats.tracked,
     })
 }
 
@@ -867,7 +1082,7 @@ async fn enqueue_session_command(
     })
 }
 
-async fn actor_session_count(state: &AppState) -> Option<usize> {
+async fn actor_session_stats(state: &AppState) -> Option<SessionStats> {
     let (done, wait_done) = oneshot::channel();
     state
         .session_tx

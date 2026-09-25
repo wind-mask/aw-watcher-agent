@@ -41,6 +41,26 @@ impl TokenUsage {
         merge_optional_max(&mut self.cache_write, incoming.cache_write);
         merge_optional_max(&mut self.total, incoming.total);
     }
+
+    /// 逐字段计算增量，供续接 summary 使用，避免重复计数。
+    fn saturating_sub(&self, other: &Self) -> Self {
+        Self {
+            input: sub_optional(self.input, other.input),
+            output: sub_optional(self.output, other.output),
+            cache_read: sub_optional(self.cache_read, other.cache_read),
+            cache_write: sub_optional(self.cache_write, other.cache_write),
+            total: sub_optional(self.total, other.total),
+        }
+    }
+
+    /// 所有字段都为空或为 0。
+    fn is_zero(&self) -> bool {
+        self.input.unwrap_or(0) == 0
+            && self.output.unwrap_or(0) == 0
+            && self.cache_read.unwrap_or(0) == 0
+            && self.cache_write.unwrap_or(0) == 0
+            && self.total.unwrap_or(0) == 0
+    }
 }
 
 /// 费用信息。不同 provider 的费用模型差异较大，因此只固定 total/currency。
@@ -58,6 +78,20 @@ pub struct ModelUsage {
     pub model: String,
     pub tokens: TokenUsage,
     pub cost: f64,
+}
+
+impl ModelUsage {
+    fn saturating_sub(&self, other: &Self) -> Self {
+        Self {
+            model: self.model.clone(),
+            tokens: self.tokens.saturating_sub(&other.tokens),
+            cost: (self.cost - other.cost).max(0.0),
+        }
+    }
+
+    fn is_zero(&self) -> bool {
+        self.tokens.is_zero() && self.cost <= 0.0
+    }
 }
 
 /// daemon 内部 session key。不同 agent 可复用相同 session_id。
@@ -195,6 +229,10 @@ pub struct ActiveSession {
     pub last_active_at: Option<DateTime<Utc>>,
     active_started_at: Option<DateTime<Utc>>,
     active_duration: TimeDelta,
+    /// 上一次写出 summary 时的累计快照；存在时后续 summary 只上报增量。
+    reported: Option<ReportedUsage>,
+    /// 续接片段（上一次 summary 之后的新活动）的起点。
+    continuation_started_at: Option<DateTime<Utc>>,
     abandoned_summary_failures: u32,
     pub metadata: Option<Value>,
 }
@@ -216,6 +254,8 @@ impl ActiveSession {
             last_active_at: None,
             active_started_at: None,
             active_duration: TimeDelta::zero(),
+            reported: None,
+            continuation_started_at: None,
             abandoned_summary_failures: 0,
             metadata: req.metadata,
         }
@@ -305,6 +345,15 @@ impl ActiveSession {
     pub fn mark_active(&mut self, at: DateTime<Utc>, active_ttl: TimeDelta) {
         let at = self.last_active_at.map_or(at, |last| at.max(last));
 
+        // 上一次 summary 之后的第一段活动：显式切断与上一片段的连接，避免 dormant
+        // 空档（可能短于 pulsetime TTL）被计入续接片段的活跃时长。
+        if self.reported.is_some() && self.continuation_started_at.is_none() {
+            if let Some(last) = self.last_active_at {
+                self.close_active_period_at(last);
+            }
+            self.continuation_started_at = Some(at);
+        }
+
         let should_start_period = self.active_started_at.is_none()
             || self
                 .last_active_at
@@ -370,6 +419,64 @@ impl ActiveSession {
         self.abandoned_summary_failures
     }
 
+    /// 连续失败的 abandoned summary 写入次数，用于限制重试噪声。
+    pub fn abandoned_summary_failures(&self) -> u32 {
+        self.abandoned_summary_failures
+    }
+
+    /// summary 写入成功后清零失败计数。
+    pub fn reset_abandoned_summary_failures(&mut self) {
+        self.abandoned_summary_failures = 0;
+    }
+
+    /// 距最近一次活动（从未活跃时取 start 时间）的时长，用于 dormant 判定。
+    pub fn idle_for(&self, now: DateTime<Utc>) -> TimeDelta {
+        let reference = self.last_active_at.unwrap_or(self.started_at);
+        now.signed_duration_since(reference).max(TimeDelta::zero())
+    }
+
+    /// 是否存在尚未写入 summary 的活动或用量。
+    pub fn has_unreported_activity(&self) -> bool {
+        match &self.reported {
+            None => self.has_been_active(),
+            Some(reported) => self.current_usage().delta_since(reported).has_any(),
+        }
+    }
+
+    /// 记录刚写出的 summary 快照；之后的活动以增量形式续接。
+    pub fn mark_reported(&mut self, summary_id: Option<String>) {
+        let usage = self.current_usage();
+        self.reported = Some(ReportedUsage {
+            summary_id,
+            tokens: usage.tokens,
+            cost: usage.cost,
+            model_usage: usage.model_usage,
+            active_duration: usage.active_duration,
+        });
+        self.continuation_started_at = None;
+    }
+
+    /// dormant 上报事件：仍标记 abandoned/timeout，但 daemon 保留状态以便续接。
+    pub fn dormant_report_event(&mut self, ended_at: DateTime<Utc>) -> Event {
+        let mut event = self.summary_event("abandoned", ended_at, Some("timeout"));
+        event.data.insert("revivable".into(), Value::Bool(true));
+        event
+    }
+
+    fn current_usage(&self) -> SummaryUsage {
+        SummaryUsage {
+            tokens: self.tokens.clone(),
+            cost: self.cost.clone(),
+            model_usage: self.model_usage.clone(),
+            active_duration: self.active_duration(),
+        }
+    }
+
+    /// 生成 sum bucket 事件。
+    ///
+    /// dormant 上报后会话继续时，本方法只上报续接片段的增量：usage 与活动
+    /// 时长均为相对上一次 summary 的增量，`started_at` 指向续接起点，并写入
+    /// `continuation_of` 指回上一份 summary。
     pub fn summary_event(
         &mut self,
         status: &str,
@@ -377,31 +484,91 @@ impl ActiveSession {
         reason: Option<&str>,
     ) -> Event {
         self.finish_active_period();
-        let active_duration = self.active_duration();
-        let mut data = self.to_summary_data(status, ended_at, reason);
+
+        let continuation = self.reported.is_some();
+        let segment_start = if continuation {
+            self.continuation_started_at.unwrap_or(ended_at)
+        } else {
+            self.started_at
+        };
+        let segment_first_active_at = if continuation {
+            self.continuation_started_at
+        } else {
+            self.first_active_at
+        };
+        let usage = match &self.reported {
+            Some(reported) => self.current_usage().delta_since(reported),
+            None => self.current_usage(),
+        };
+
+        let active_duration = usage.active_duration;
+        let wall_duration = ended_at
+            .signed_duration_since(segment_start)
+            .max(TimeDelta::zero());
+        let mut data = match &self.reported {
+            Some(reported) => self.build_summary_data(
+                status,
+                ended_at,
+                reason,
+                segment_start,
+                segment_first_active_at,
+                &usage.tokens,
+                &usage.cost,
+                &usage.model_usage,
+                reported.summary_id.as_deref(),
+            ),
+            None => self.to_summary_data(status, ended_at, reason),
+        };
         data.insert(
             "active_duration_seconds".into(),
             Value::from(duration_seconds(active_duration)),
         );
         data.insert(
             "wall_duration_seconds".into(),
-            Value::from(duration_seconds(self.wall_duration_until(ended_at))),
+            Value::from(duration_seconds(wall_duration)),
         );
 
         Event {
             id: None,
-            timestamp: self.first_active_at.unwrap_or(self.started_at),
+            timestamp: segment_first_active_at.unwrap_or(segment_start),
             duration: active_duration,
             data,
         }
     }
 
-    /// 转为 sum bucket 的 ActivityWatch data 字段。
+    /// 转为 sum bucket 的 ActivityWatch data 字段（整段会话的累计值）。
     pub fn to_summary_data(
         &self,
         status: &str,
         ended_at: DateTime<Utc>,
         reason: Option<&str>,
+    ) -> Map<String, Value> {
+        self.build_summary_data(
+            status,
+            ended_at,
+            reason,
+            self.started_at,
+            self.first_active_at,
+            &self.tokens,
+            &self.cost,
+            &self.model_usage,
+            None,
+        )
+    }
+
+    /// 按指定片段与 usage 构造 sum bucket data 字段。
+    #[allow(clippy::too_many_arguments)]
+    fn build_summary_data(
+        &self,
+        status: &str,
+        ended_at: DateTime<Utc>,
+        reason: Option<&str>,
+        segment_start: DateTime<Utc>,
+        segment_first_active_at: Option<DateTime<Utc>>,
+        tokens: &TokenUsage,
+        cost: &CostUsage,
+        model_usage: &HashMap<String, ModelUsage>,
+        continuation_of: Option<&str>,
     ) -> Map<String, Value> {
         let mut data = Map::new();
 
@@ -417,7 +584,7 @@ impl ActiveSession {
         }
         data.insert(
             "summary_id".into(),
-            Value::String(self.summary_id(status, ended_at, reason)),
+            Value::String(self.summary_id(status, ended_at, reason, segment_start)),
         );
         data.insert(
             "session_id".into(),
@@ -439,21 +606,21 @@ impl ActiveSession {
         );
         data.insert(
             "started_at".into(),
-            Value::String(self.started_at.to_rfc3339()),
+            Value::String(segment_start.to_rfc3339()),
         );
         data.insert("ended_at".into(), Value::String(ended_at.to_rfc3339()));
-        if let Some(value) = &self.first_active_at {
+        if let Some(value) = segment_first_active_at {
             data.insert("first_active_at".into(), Value::String(value.to_rfc3339()));
         }
         if let Some(value) = &self.last_active_at {
             data.insert("last_active_at".into(), Value::String(value.to_rfc3339()));
         }
 
-        insert_token_usage(&mut data, &self.tokens);
-        if let Some(value) = self.cost.total {
+        insert_token_usage(&mut data, tokens);
+        if let Some(value) = cost.total {
             data.insert("cost_total".into(), Value::from(value));
         }
-        if let Some(value) = &self.cost.currency {
+        if let Some(value) = &cost.currency {
             data.insert("cost_currency".into(), Value::String(value.clone()));
         }
         if let Some(value) = &self.metadata {
@@ -465,13 +632,18 @@ impl ActiveSession {
                 Value::String(selected_model.clone()),
             );
         }
-        if let Some(model) = self.summary_model() {
+        if let Some(continuation_of) = continuation_of {
+            data.insert(
+                "continuation_of".into(),
+                Value::String(continuation_of.to_string()),
+            );
+        }
+        if let Some(model) = Self::summary_model(model_usage, self.model.as_deref()) {
             data.insert("model".into(), Value::String(model.to_string()));
         }
 
-        if !self.model_usage.is_empty() {
-            let per_model: Map<String, Value> = self
-                .model_usage
+        if !model_usage.is_empty() {
+            let per_model: Map<String, Value> = model_usage
                 .iter()
                 .map(|(model, mu)| {
                     let mut m = Map::new();
@@ -495,7 +667,13 @@ impl ActiveSession {
         }
     }
 
-    fn summary_id(&self, status: &str, ended_at: DateTime<Utc>, reason: Option<&str>) -> String {
+    fn summary_id(
+        &self,
+        status: &str,
+        ended_at: DateTime<Utc>,
+        reason: Option<&str>,
+        segment_start: DateTime<Utc>,
+    ) -> String {
         format!(
             "{}:{}:{}:{}:{}:{}:{}",
             self.key.code_agent,
@@ -503,17 +681,111 @@ impl ActiveSession {
             self.key.session_instance_id.as_deref().unwrap_or("legacy"),
             status,
             reason.unwrap_or("none"),
-            self.started_at.to_rfc3339(),
+            segment_start.to_rfc3339(),
             ended_at.to_rfc3339()
         )
     }
 
-    fn summary_model(&self) -> Option<&str> {
-        match self.model_usage.len() {
-            0 => self.model.as_deref(),
-            1 => self.model_usage.keys().next().map(String::as_str),
+    /// 单一使用模型时给出模型名；多模型时为 `multiple`，无 usage 时回退到选中模型。
+    fn summary_model<'a>(
+        model_usage: &'a HashMap<String, ModelUsage>,
+        selected_model: Option<&'a str>,
+    ) -> Option<&'a str> {
+        match model_usage.len() {
+            0 => selected_model,
+            1 => model_usage.keys().next().map(String::as_str),
             _ => Some("multiple"),
         }
+    }
+}
+
+/// daemon 已不再持有该会话状态（重启或超过保留期）时的 best-effort summary。
+///
+/// end 请求不携带 project 与起始时间，因此 `started_at` 退化为 `ended_at`、时长记为 0，
+/// 并以 `status=abandoned` / `reason=late_end` + `metadata.orphan` 标记成孤儿记录，
+/// 主要目的是保住结尾上报的 usage 快照。
+pub fn orphan_summary_event(req: &SessionEndRequest, ended_at: DateTime<Utc>) -> Event {
+    const UNKNOWN_PROJECT: &str = "unknown";
+
+    let key = req.key();
+    let timestamp = ended_at.to_rfc3339();
+    let mut data = Map::new();
+    data.insert("project".into(), Value::String(UNKNOWN_PROJECT.into()));
+    data.insert("file".into(), Value::String(UNKNOWN_PROJECT.into()));
+    data.insert("language".into(), Value::String("code-agent".into()));
+    data.insert("status".into(), Value::String("abandoned".into()));
+    data.insert("reason".into(), Value::String("late_end".into()));
+    data.insert(
+        "summary_id".into(),
+        Value::String(format!(
+            "{}:{}:{}:abandoned:late_end:{}:{}",
+            key.code_agent,
+            key.session_id,
+            key.session_instance_id.as_deref().unwrap_or("legacy"),
+            timestamp,
+            timestamp
+        )),
+    );
+    data.insert("session_id".into(), Value::String(key.session_id.clone()));
+    if let Some(instance_id) = &key.session_instance_id {
+        data.insert(
+            "session_instance_id".into(),
+            Value::String(instance_id.clone()),
+        );
+    }
+    data.insert("code_agent".into(), Value::String(key.code_agent.clone()));
+    data.insert("project_dir".into(), Value::String(UNKNOWN_PROJECT.into()));
+    data.insert("started_at".into(), Value::String(timestamp.clone()));
+    data.insert("ended_at".into(), Value::String(timestamp.clone()));
+    data.insert("active_duration_seconds".into(), Value::from(0.0));
+    data.insert("wall_duration_seconds".into(), Value::from(0.0));
+
+    let tokens = req.tokens.clone().unwrap_or_default();
+    insert_token_usage(&mut data, &tokens);
+    if let Some(cost) = &req.cost {
+        if let Some(total) = cost.total {
+            data.insert("cost_total".into(), Value::from(total));
+        }
+        if let Some(currency) = &cost.currency {
+            data.insert("cost_currency".into(), Value::String(currency.clone()));
+        }
+    }
+    if let Some(model_usage) = &req.model_usage {
+        let per_model: Map<String, Value> = model_usage
+            .iter()
+            .map(|usage| {
+                let mut entry = Map::new();
+                insert_token_usage(&mut entry, &usage.tokens);
+                entry.insert("cost".into(), Value::from(usage.cost));
+                (usage.model.clone(), Value::Object(entry))
+            })
+            .collect();
+        match per_model.len() {
+            0 => {}
+            1 => {
+                if let Some(model) = per_model.keys().next() {
+                    data.insert("model".into(), Value::String(model.clone()));
+                }
+            }
+            _ => {
+                data.insert("model".into(), Value::String("multiple".into()));
+            }
+        }
+        data.insert("model_usage".into(), Value::Object(per_model));
+    }
+
+    let mut metadata = Map::new();
+    metadata.insert("orphan".into(), Value::Bool(true));
+    if let Some(Value::Object(incoming)) = &req.metadata {
+        metadata.extend(incoming.clone());
+    }
+    data.insert("metadata".into(), Value::Object(metadata));
+
+    Event {
+        id: None,
+        timestamp: ended_at,
+        duration: TimeDelta::zero(),
+        data,
     }
 }
 
@@ -521,6 +793,70 @@ fn merge_optional_max(target: &mut Option<u64>, incoming: Option<u64>) {
     if let Some(incoming) = incoming {
         *target = Some(target.map_or(incoming, |current| current.max(incoming)));
     }
+}
+
+/// 已写出 summary 时的累计快照，用于计算续接片段的增量。
+#[derive(Debug, Clone)]
+struct ReportedUsage {
+    summary_id: Option<String>,
+    tokens: TokenUsage,
+    cost: CostUsage,
+    model_usage: HashMap<String, ModelUsage>,
+    active_duration: TimeDelta,
+}
+
+/// 累计 usage 与活动时长；续接 summary 上报它与快照的差值。
+#[derive(Debug, Clone)]
+struct SummaryUsage {
+    tokens: TokenUsage,
+    cost: CostUsage,
+    model_usage: HashMap<String, ModelUsage>,
+    active_duration: TimeDelta,
+}
+
+impl SummaryUsage {
+    fn delta_since(&self, reported: &ReportedUsage) -> Self {
+        Self {
+            tokens: self.tokens.saturating_sub(&reported.tokens),
+            cost: CostUsage {
+                total: self
+                    .cost
+                    .total
+                    .map(|total| (total - reported.cost.total.unwrap_or(0.0)).max(0.0)),
+                currency: self.cost.currency.clone(),
+            },
+            model_usage: delta_model_usage(&self.model_usage, &reported.model_usage),
+            active_duration: (self.active_duration - reported.active_duration)
+                .max(TimeDelta::zero()),
+        }
+    }
+
+    fn has_any(&self) -> bool {
+        self.active_duration > TimeDelta::zero()
+            || !self.tokens.is_zero()
+            || self.cost.total.unwrap_or(0.0) > 0.0
+            || !self.model_usage.is_empty()
+    }
+}
+
+fn sub_optional(current: Option<u64>, baseline: Option<u64>) -> Option<u64> {
+    current.map(|current| current.saturating_sub(baseline.unwrap_or(0)))
+}
+
+fn delta_model_usage(
+    current: &HashMap<String, ModelUsage>,
+    reported: &HashMap<String, ModelUsage>,
+) -> HashMap<String, ModelUsage> {
+    current
+        .iter()
+        .filter_map(|(model, usage)| {
+            let delta = match reported.get(model) {
+                Some(previous) => usage.saturating_sub(previous),
+                None => usage.clone(),
+            };
+            (!delta.is_zero()).then(|| (model.clone(), delta))
+        })
+        .collect()
 }
 
 fn add_optional(target: &mut Option<u64>, incoming: Option<u64>) {
@@ -1064,5 +1400,233 @@ mod tests {
         assert_eq!(session.tokens.total, Some(100));
         assert_eq!(session.cost.total, Some(1.0));
         assert!(session.model_usage.is_empty());
+    }
+
+    fn usage_update(input: u64, output: u64, cost: f64) -> SessionUpdateRequest {
+        SessionUpdateRequest {
+            session_id: "session-1".to_string(),
+            session_instance_id: Some("run-1".to_string()),
+            code_agent: "codex".to_string(),
+            model: Some("gpt-5".to_string()),
+            tokens: Some(TokenUsage {
+                input: Some(input),
+                output: Some(output),
+                total: Some(input + output),
+                ..Default::default()
+            }),
+            cost: Some(CostUsage {
+                total: Some(cost),
+                currency: Some("USD".to_string()),
+            }),
+            model_usage: Some(vec![ModelUsage {
+                model: "gpt-5".to_string(),
+                tokens: TokenUsage {
+                    input: Some(input),
+                    output: Some(output),
+                    total: Some(input + output),
+                    ..Default::default()
+                },
+                cost,
+            }]),
+            active: None,
+            active_at: None,
+            metadata: None,
+        }
+    }
+
+    fn summary_id_of(event: &Event) -> Option<String> {
+        event
+            .data
+            .get("summary_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+
+    #[test]
+    fn dormant_report_then_continuation_reports_only_new_activity() {
+        let mut session = ActiveSession::from_start(start_req());
+        let ttl = TimeDelta::seconds(25);
+
+        // 片段一：活跃 10s，累计 10 进 / 5 出 / $0.5
+        session.mark_active(ts(10), ttl);
+        session.mark_active(ts(20), ttl);
+        session.apply_update(usage_update(10, 5, 0.5));
+
+        let first = session.dormant_report_event(ts(20));
+        session.mark_reported(summary_id_of(&first));
+
+        assert_eq!(
+            first.data.get("status"),
+            Some(&Value::String("abandoned".into()))
+        );
+        assert_eq!(
+            first.data.get("reason"),
+            Some(&Value::String("timeout".into()))
+        );
+        assert_eq!(first.data.get("revivable"), Some(&Value::Bool(true)));
+        assert_eq!(first.data.get("tokens_total"), Some(&Value::from(15)));
+        assert_eq!(first.data.get("cost_total"), Some(&Value::from(0.5)));
+        assert_eq!(
+            first
+                .data
+                .get("active_duration_seconds")
+                .and_then(Value::as_f64),
+            Some(10.0)
+        );
+        assert!(first.data.get("continuation_of").is_none());
+
+        // 上报之后没有新活动：不应再写一份重复的 summary
+        assert!(!session.has_unreported_activity());
+
+        // 片段二：续接活跃 10s，累计 30 进 / 10 出 / $0.75
+        session.mark_active(ts(100), ttl);
+        session.mark_active(ts(110), ttl);
+        session.apply_update(usage_update(30, 10, 0.75));
+        assert!(session.has_unreported_activity());
+
+        let second = session.summary_event("completed", ts(110), None);
+        assert_eq!(
+            second.data.get("status"),
+            Some(&Value::String("completed".into()))
+        );
+        // usage 与活动时长都只算增量
+        assert_eq!(second.data.get("tokens_input"), Some(&Value::from(20)));
+        assert_eq!(second.data.get("tokens_output"), Some(&Value::from(5)));
+        assert_eq!(second.data.get("tokens_total"), Some(&Value::from(25)));
+        assert_eq!(second.data.get("cost_total"), Some(&Value::from(0.25)));
+        assert_eq!(
+            second
+                .data
+                .get("active_duration_seconds")
+                .and_then(Value::as_f64),
+            Some(10.0)
+        );
+        assert_eq!(
+            second.data.get("started_at"),
+            Some(&Value::String(ts(100).to_rfc3339()))
+        );
+        assert_eq!(
+            second
+                .data
+                .get("wall_duration_seconds")
+                .and_then(Value::as_f64),
+            Some(10.0)
+        );
+        assert_eq!(
+            second.data.get("continuation_of"),
+            first.data.get("summary_id")
+        );
+        assert_eq!(second.timestamp, ts(100));
+        assert_eq!(second.duration, TimeDelta::seconds(10));
+
+        let gpt5 = second
+            .data
+            .get("model_usage")
+            .and_then(Value::as_object)
+            .and_then(|usage| usage.get("gpt-5"))
+            .and_then(Value::as_object)
+            .expect("continuation keeps the model delta");
+        assert_eq!(gpt5.get("tokens_total"), Some(&Value::from(25)));
+        assert_eq!(gpt5.get("cost"), Some(&Value::from(0.25)));
+    }
+
+    #[test]
+    fn continuation_excludes_idle_gap_shorter_than_pulse_ttl() {
+        // idle 阈值小于 pulsetime TTL 时，续接也必须从新片段重新计时。
+        let mut session = ActiveSession::from_start(start_req());
+        let ttl = TimeDelta::seconds(25);
+
+        session.mark_active(ts(0), ttl);
+        session.mark_active(ts(10), ttl);
+        let first = session.dormant_report_event(ts(10));
+        session.mark_reported(summary_id_of(&first));
+        assert_eq!(
+            first
+                .data
+                .get("active_duration_seconds")
+                .and_then(Value::as_f64),
+            Some(10.0)
+        );
+
+        // 8s 空档 < TTL：续接片段不能把空档算进活跃时长
+        session.mark_active(ts(18), ttl);
+        session.mark_active(ts(23), ttl);
+        let second = session.summary_event("completed", ts(23), None);
+        assert_eq!(
+            second
+                .data
+                .get("active_duration_seconds")
+                .and_then(Value::as_f64),
+            Some(5.0)
+        );
+        assert_eq!(second.timestamp, ts(18));
+        assert_eq!(second.duration, TimeDelta::seconds(5));
+    }
+
+    #[test]
+    fn never_active_session_has_nothing_to_report() {
+        let session = ActiveSession::from_start(start_req());
+
+        assert!(!session.has_unreported_activity());
+        assert_eq!(session.idle_for(ts(120)), TimeDelta::seconds(120));
+    }
+
+    #[test]
+    fn orphan_summary_keeps_end_usage_and_marks_late_end() {
+        let event = orphan_summary_event(
+            &SessionEndRequest {
+                session_id: "session-9".to_string(),
+                session_instance_id: Some("run-9".to_string()),
+                code_agent: "pi".to_string(),
+                ended_at: Some(ts(0)),
+                tokens: Some(TokenUsage {
+                    input: Some(7),
+                    output: Some(3),
+                    total: Some(10),
+                    ..Default::default()
+                }),
+                cost: Some(CostUsage {
+                    total: Some(0.25),
+                    currency: Some("USD".to_string()),
+                }),
+                model_usage: Some(vec![ModelUsage {
+                    model: "gpt-5".to_string(),
+                    tokens: TokenUsage {
+                        input: Some(7),
+                        output: Some(3),
+                        ..Default::default()
+                    },
+                    cost: 0.25,
+                }]),
+                metadata: Some(json!({ "shutdown_reason": "quit" })),
+            },
+            ts(30),
+        );
+
+        assert_eq!(event.timestamp, ts(30));
+        assert_eq!(event.duration, TimeDelta::zero());
+        assert_eq!(
+            event.data.get("status"),
+            Some(&Value::String("abandoned".into()))
+        );
+        assert_eq!(
+            event.data.get("reason"),
+            Some(&Value::String("late_end".into()))
+        );
+        assert_eq!(event.data.get("tokens_total"), Some(&Value::from(10)));
+        assert_eq!(event.data.get("cost_total"), Some(&Value::from(0.25)));
+        assert_eq!(
+            event.data.get("model"),
+            Some(&Value::String("gpt-5".into()))
+        );
+        assert_eq!(
+            event.data.get("metadata"),
+            Some(&json!({ "orphan": true, "shutdown_reason": "quit" }))
+        );
+        let summary_id = summary_id_of(&event).expect("orphan summary id");
+        assert!(
+            summary_id.contains(":abandoned:late_end:"),
+            "unexpected summary id: {summary_id}"
+        );
     }
 }
