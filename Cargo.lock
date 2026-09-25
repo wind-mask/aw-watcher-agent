@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "aw-watcher-agent"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "aw-client-rust",
